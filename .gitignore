@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+
+# Local state and secrets
+*.db
+*.db-journal
+trenchnet.toml
+.env
+wallets.txt
+data/

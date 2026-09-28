@@ -1,0 +1,7 @@
+# Candidate wallets: one Solana address per line, optionally ",alias".
+# Sources for candidates: pump.fun / Fomo / GMGN / Birdeye leaderboards, or
+# wallets you have been watching by hand. `trenchnet profile` decides which
+# of them make the roster using the [selection] criteria.
+#
+# <wallet address>,alpha
+# <wallet address>,beta

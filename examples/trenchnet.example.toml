@@ -1,0 +1,79 @@
+# Copy to ./trenchnet.toml and edit. Every key is optional; defaults are shown.
+# Unknown keys are rejected so typos don't silently fall back to defaults.
+
+db_path = "trenchnet.db"
+
+[llm]
+profile_model = "claude-opus-5-5"   # stage 1: trader profiles
+report_model = "claude-opus-5-5"    # stage 4: situation reports
+profile_effort = "high"
+report_effort = "medium"
+judge_model = "claude-haiku-4-5"    # stage 3: narrow judgments (the article's "Jev" role)
+use_llm_profiles = true
+use_llm_judge = true
+use_llm_reports = true
+max_trades_in_prompt = 400
+background_reports = true           # live mode: never make trading wait on a report
+
+[selection]                         # explicit roster criteria
+min_closed_positions = 5
+min_realized_pnl_sol = 1.0
+min_win_rate = 0.3
+max_top_token_share = 0.85          # reject wallets whose profit is mostly one lucky token
+max_quick_flip_share = 0.9          # reject pure scalpers you can't follow in time
+
+[graph]
+co_entry_window_s = 1800            # "arriving together"
+min_co_entries = 2
+min_jaccard = 0.15
+min_lift = 1.5
+min_history_tokens = 5
+
+[router]
+min_buyers_for_analysis = 2
+min_confidence = 0.55
+
+[strategy]
+enabled = true
+min_tracked_buyers = 3
+entry_window_s = 900
+min_independent_clusters = 2        # the usual group + at least one outsider
+min_supportive_buys = 1
+max_insufficient_history_share = 0.5
+min_active_holder_fraction = 0.5
+max_entry_delay_s = 1800
+max_run_up = 3.0
+# min_market_cap_sol = 30
+# max_market_cap_sol = 400
+position_size_sol = 0.1
+max_open_positions = 5
+max_total_exposure_sol = 0.5
+daily_loss_limit_sol = 0.3
+stop_loss_pct = 0.35
+take_profit = [[2.0, 0.5]]          # [multiple of entry, fraction of original size]
+trailing_stop_pct = 0.30
+max_hold_s = 21600
+exit_on_cohort_sold_fraction = 0.5
+exit_on_leader_exit = true
+reenter_same_mint = false
+
+[paper]
+starting_balance_sol = 5.0
+fee_bps = 150
+slippage_bps = 300
+latency_penalty_bps = 200
+
+[live]
+enabled = false                     # also requires --live and TRENCHNET_LIVE_ACK (see README)
+rpc_url = "https://api.mainnet-beta.solana.com"
+private_key_env = "SOLANA_PRIVATE_KEY"
+slippage_pct = 15
+priority_fee_sol = 0.0005
+pool = "auto"
+max_position_sol = 0.05             # hard cap per buy, applied after strategy sizing
+confirm_timeout_s = 45
+
+[pumpportal]
+ws_url = "wss://pumpportal.fun/api/data"
+trade_url = "https://pumpportal.fun/api/trade-local"
+api_key_env = "PUMPPORTAL_API_KEY"
