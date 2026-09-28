@@ -85,3 +85,15 @@ def test_recent_open_positions_are_reported():
     s = compute_wallet_stats("w", trades)
     assert s.open_positions == 6
     assert s.recent_open_share == pytest.approx(0.6)
+
+
+def test_reentry_after_large_closed_position_is_a_fresh_round():
+    led = Ledger()
+    led.apply(mk("w", "m", "buy", 1.0, 50_000_000, 0))
+    led.apply(mk("w", "m", "sell", 2.0, 50_000_000, 100))
+    p = led.apply(mk("w", "m", "buy", 1.0, 40_000, 200))  # small bag after a big run-up
+    assert p.is_open and p.status == "holding" and p.rounds == 2
+    assert p.first_buy_ts == 200 and p.sold_fraction == 0
+    p = led.apply(mk("w", "m", "sell", 0.6, 20_000, 300))
+    assert p.status == "reduced"
+    assert p.realized_pnl_sol == pytest.approx(1.0 + 0.1)  # cumulative across rounds

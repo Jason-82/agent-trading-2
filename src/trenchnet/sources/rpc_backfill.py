@@ -8,10 +8,13 @@ own balance changes in each transaction.
 * token moves with no matching SOL   -> transfer (never a sale)
 
 Wrapped-SOL balance changes are counted as SOL. The network fee is excluded
-when the wallet paid it. Token-account rent (created on first buy, refunded
-when the account is closed) is excluded using the standard SPL account rent.
-Transactions touching several tokens at once are skipped rather than guessed.
-Priority/Jito tips paid by the wallet remain inside the SOL amount.
+when the wallet paid it. Token-account rent (paid when one of the wallet's
+token accounts is created, refunded when it is closed) is excluded using that
+account's actual lamports, so SPL and Token-2022 accounts are both handled.
+SOL moves smaller than MIN_SOL_MOVE are treated as noise, so a transfer that
+also pays a small tip is still a transfer. Transactions touching several
+tokens at once are skipped rather than guessed. Tips paid alongside a real
+trade remain inside its SOL amount.
 
 This makes one getTransaction call per signature; use a paid RPC for large
 backfills.
@@ -28,8 +31,7 @@ from ..solana_rpc import LAMPORTS_PER_SOL, SolanaRpc
 log = logging.getLogger(__name__)
 
 WSOL = "So11111111111111111111111111111111111111112"
-TOKEN_ACCOUNT_RENT_SOL = 0.00203928
-MIN_SOL_MOVE = 1e-6
+MIN_SOL_MOVE = 0.001
 
 
 def _key(k: Any) -> str:
@@ -45,6 +47,10 @@ def _token_amounts(balances: list[dict] | None, owner: str) -> dict[str, float]:
         v = amt.get("uiAmountString") or amt.get("uiAmount") or 0
         out[b["mint"]] = out.get(b["mint"], 0.0) + float(v)
     return out
+
+
+def _owned_accounts(balances: list[dict] | None, owner: str) -> set[int]:
+    return {b["accountIndex"] for b in balances or [] if b.get("owner") == owner and "accountIndex" in b}
 
 
 def parse_wallet_tx(tx: dict | None, wallet: str, signature: str) -> list[Trade]:
@@ -63,16 +69,20 @@ def parse_wallet_tx(tx: dict | None, wallet: str, signature: str) -> list[Trade]
     post = _token_amounts(meta.get("postTokenBalances"), wallet)
     sol_delta += post.pop(WSOL, 0.0) - pre.pop(WSOL, 0.0)
 
+    # Rent for the wallet's token accounts created or closed in this tx is not
+    # part of the trade.
+    pre_accts = _owned_accounts(meta.get("preTokenBalances"), wallet)
+    post_accts = _owned_accounts(meta.get("postTokenBalances"), wallet)
+    for idx in post_accts - pre_accts:  # created: rent now sits in the account
+        sol_delta += meta["postBalances"][idx] / LAMPORTS_PER_SOL
+    for idx in pre_accts - post_accts:  # closed: rent refunded to the wallet
+        sol_delta -= meta["preBalances"][idx] / LAMPORTS_PER_SOL
+
     deltas = {m: post.get(m, 0.0) - pre.get(m, 0.0) for m in set(pre) | set(post)}
     deltas = {m: d for m, d in deltas.items() if abs(d) > 0}
     if len(deltas) != 1:
         return []
     mint, d = next(iter(deltas.items()))
-    # Account creation/closing rent is not part of the trade price.
-    if mint in post and mint not in pre:
-        sol_delta += TOKEN_ACCOUNT_RENT_SOL
-    elif mint in pre and mint not in post:
-        sol_delta -= TOKEN_ACCOUNT_RENT_SOL
 
     if d > 0 and sol_delta < -MIN_SOL_MOVE:
         side, sol = Side.BUY, -sol_delta

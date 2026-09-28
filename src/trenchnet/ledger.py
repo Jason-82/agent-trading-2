@@ -43,11 +43,26 @@ class Position:
     closed_ts: float | None = None
     closed_by_transfer: bool = False
     peak_tokens: float = 0.0
+    rounds: int = 1
     signatures: list[str] = field(default_factory=list)
 
     # -- mutation -----------------------------------------------------------
 
+    def _new_round(self) -> None:
+        """Re-entry after the position was closed: per-round figures restart
+        (so an old, larger peak can't make the new position look like dust);
+        realized PnL and unattributed proceeds stay cumulative."""
+        self.bought_sol = self.bought_tokens = self.sold_sol = self.sold_tokens = 0.0
+        self.transferred_in = self.transferred_out = 0.0
+        self.n_buys = self.n_sells = 0
+        self.first_buy_ts = self.first_sell_ts = self.closed_ts = None
+        self.closed_by_transfer = False
+        self.peak_tokens = 0.0
+        self.rounds += 1
+
     def apply(self, t: Trade) -> None:
+        if t.side in (Side.BUY, Side.TRANSFER_IN) and self.closed_ts is not None:
+            self._new_round()
         if self.first_ts is None:
             self.first_ts = t.ts
         self.last_ts = t.ts
@@ -62,8 +77,6 @@ class Position:
             self.n_buys += 1
             if self.first_buy_ts is None:
                 self.first_buy_ts = t.ts
-            self.closed_ts = None
-            self.closed_by_transfer = False
         elif t.side is Side.SELL:
             q = t.token_amount
             if q <= 0:
@@ -100,8 +113,6 @@ class Position:
         elif t.side is Side.TRANSFER_IN:
             self.tokens += t.token_amount
             self.transferred_in += t.token_amount
-            self.closed_ts = None
-            self.closed_by_transfer = False
 
         self.peak_tokens = max(self.peak_tokens, self.tokens)
 

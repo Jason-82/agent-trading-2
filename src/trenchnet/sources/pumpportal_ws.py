@@ -71,8 +71,13 @@ class PumpPortalSource:
         return f"{self.cfg.ws_url}?api-key={self.api_key}" if self.api_key else self.cfg.ws_url
 
     async def _send(self, payload: dict) -> None:
-        if self._ws is not None:
+        if self._ws is None:
+            return
+        try:
             await self._ws.send(json.dumps(payload))
+        except (OSError, websockets.WebSocketException) as e:
+            # _tokens is already updated; the reconnect loop resubscribes.
+            log.warning("pumpportal send failed (%s); will resubscribe on reconnect", e)
 
     async def watch_tokens(self, mints: Iterable[str]) -> None:
         new = set(mints) - self._tokens

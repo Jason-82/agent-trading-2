@@ -43,6 +43,10 @@ class LLM:
             raise LLMError(f"{model}: API error {e.status_code}: {e.message}") from e
         except anthropic.APIConnectionError as e:
             raise LLMError(f"{model}: connection error: {e}") from e
+        except anthropic.APIError as e:
+            raise LLMError(f"{model}: {e}") from e
+        except ValueError as e:  # incl. pydantic.ValidationError: truncated or off-schema output
+            raise LLMError(f"{model}: unusable structured output: {e}") from e
 
         if resp.stop_reason == "refusal":
             category = getattr(resp.stop_details, "category", None) if resp.stop_details else None

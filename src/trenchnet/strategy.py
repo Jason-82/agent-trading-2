@@ -90,7 +90,7 @@ class Strategy:
                       and a["assessment"]["position_intent"] in ("standard", "conviction")]
         if len(supportive) < c.min_supportive_buys:
             return None, [f"{len(supportive)} buys fit their wallet's pattern (< {c.min_supportive_buys})"]
-        thin = len([w for w in cohort if w in rel.thin_history]) / len(cohort)
+        thin = len([w for w in cohort if w in rel.thin_history]) / len(cohort) if cohort else 0.0
         if thin > c.max_insufficient_history_share:
             return None, [f"{thin:.0%} of cohort has thin history"]
         if now - case.first_entry_ts > c.max_entry_delay_s:

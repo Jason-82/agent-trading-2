@@ -63,22 +63,44 @@ class PumpPortalBroker:
             raise RuntimeError("RPC returned no signature")
         return str(sig)
 
+    async def _settle(self, sig: str | None) -> None:
+        """Wait for the transaction; if it is still unconfirmed, give it a
+        further grace period so balances reflect it before reconciling."""
+        if sig is None:
+            return
+        try:
+            ok = await self.rpc.wait_confirmed(sig, self.cfg.live.confirm_timeout_s)
+            if not ok:
+                log.warning("tx %s not confirmed within %.0fs; reconciling from balances",
+                            sig, self.cfg.live.confirm_timeout_s)
+                await self.rpc.wait_confirmed(sig, self.cfg.live.confirm_timeout_s)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not confirm %s (%s); reconciling from balances", sig, e)
+
     async def buy(self, mint: str, sol_amount: float, ref_price: float, ts: float, reason: str) -> Fill | None:
         sol_amount = min(sol_amount, self.cfg.live.max_position_sol)
         try:
             pre_tokens = await self.rpc.get_token_balance(self.owner, mint)
             pre_sol = await self.rpc.get_balance_sol(self.owner)
+        except Exception as e:  # noqa: BLE001 - a failed live order must never crash the engine
+            log.error("live buy %s aborted before submitting: %s", mint, e)
+            return None
+        sig = None
+        try:
             sig = await self._submit("buy", mint, sol_amount, in_sol=True)
-            if not await self.rpc.wait_confirmed(sig, self.cfg.live.confirm_timeout_s):
-                log.error("buy %s not confirmed (sig %s)", mint, sig)
-                return None
+        except Exception as e:  # noqa: BLE001
+            # The request may still have reached the chain; reconcile before giving up.
+            log.error("live buy %s submit error: %s", mint, e)
+        await self._settle(sig)
+        # Balances, not the confirmation result, decide whether we now hold tokens.
+        try:
             got = await self.rpc.get_token_balance(self.owner, mint) - pre_tokens
             spent = pre_sol - await self.rpc.get_balance_sol(self.owner)
-        except Exception as e:  # noqa: BLE001 - a failed live order must never crash the engine
-            log.error("live buy %s failed: %s", mint, e)
+        except Exception as e:  # noqa: BLE001
+            log.error("live buy %s: balance check failed (%s); treat position as UNKNOWN (sig %s)", mint, e, sig)
             return None
         if got <= 0:
-            log.error("buy %s confirmed but no tokens received (sig %s)", mint, sig)
+            log.error("buy %s: no tokens received (sig %s)", mint, sig)
             return None
         spent = spent if spent > 0 else sol_amount
         return Fill(mint, "buy", spent, got, spent / got, max(0.0, spent - sol_amount), ts, self.mode, reason, sig)
@@ -92,14 +114,20 @@ class PumpPortalBroker:
                 return None
             amount: float | str = "100%" if qty >= balance * 0.999 else qty
             pre_sol = await self.rpc.get_balance_sol(self.owner)
+        except Exception as e:  # noqa: BLE001
+            log.error("live sell %s aborted before submitting: %s", mint, e)
+            return None
+        sig = None
+        try:
             sig = await self._submit("sell", mint, amount, in_sol=False)
-            if not await self.rpc.wait_confirmed(sig, self.cfg.live.confirm_timeout_s):
-                log.error("sell %s not confirmed (sig %s)", mint, sig)
-                return None
+        except Exception as e:  # noqa: BLE001
+            log.error("live sell %s submit error: %s", mint, e)
+        await self._settle(sig)
+        try:
             sold = balance - await self.rpc.get_token_balance(self.owner, mint)
             received = await self.rpc.get_balance_sol(self.owner) - pre_sol
         except Exception as e:  # noqa: BLE001
-            log.error("live sell %s failed: %s", mint, e)
+            log.error("live sell %s: balance check failed (%s) (sig %s)", mint, e, sig)
             return None
         if sold <= 0:
             return None

@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from dataclasses import fields
 from typing import Awaitable, Callable, Iterable
 
-from .brokers.base import Broker
+from .brokers.base import Broker, Fill
 from .cases import Case, TrackedWallet, build_snapshot, iso
 from .config import Config
 from .graph import TradeGraph
@@ -29,6 +31,8 @@ from .store import Store
 from .strategy import Order, Strategy
 
 log = logging.getLogger(__name__)
+
+_TP_REASON = re.compile(r"^take-profit (\d+):")
 
 
 def tracked_from_roster(roster: list[dict]) -> dict[str, TrackedWallet]:
@@ -62,6 +66,9 @@ class Engine:
         self.seen: set[tuple] = set()
         self.now = 0.0
         self._tasks: set[asyncio.Task] = set()
+        # One order at a time per token: the ticker and the event loop both run
+        # exits, and live orders await confirmation.
+        self._locks: dict[str, asyncio.Lock] = {}
         self.skips: dict[str, str] = {}  # mint -> last entry-blocking reason
         for t in sorted(history, key=lambda t: t.ts):
             if t.wallet in self.tracked_set:
@@ -71,6 +78,27 @@ class Engine:
 
     def name(self, wallet: str) -> str:
         return self.tracked[wallet].alias if wallet in self.tracked else short(wallet)
+
+    def _lock(self, mint: str) -> asyncio.Lock:
+        lock = self._locks.get(mint)
+        if lock is None:
+            lock = self._locks[mint] = asyncio.Lock()
+        return lock
+
+    def restore(self, fills: list[dict]) -> None:
+        """Rebuild the bot's holdings from stored fills after a restart, and
+        reopen a case for each token still held so exits keep running."""
+        names = {f.name for f in fields(Fill)}
+        for row in fills:
+            fill = Fill(**{k: row[k] for k in names})
+            m = _TP_REASON.match(fill.reason) if fill.side == "sell" else None
+            self.portfolio.apply(fill, tp_index=int(m.group(1)) - 1 if m else None)
+        for mint, h in self.portfolio.holdings.items():
+            case = self.cases[mint] = Case(mint=mint, opened_ts=h.entry_ts)
+            for t in self.store.trades(wallets=list(self.tracked_set), mint=mint):
+                case.add_event(t)
+            if mint not in self.prices and case.last_price is not None:
+                self.prices[mint] = case.last_price
 
     # -- events -----------------------------------------------------------
 
@@ -130,11 +158,15 @@ class Engine:
         if decision.route == "analyze":
             await self._report(case, snap, t)
 
-        order, reasons = self.strategy.entry(case, self.ledger, self.tracked_set, rel, self.now)
-        if order is not None:
-            await self._execute(order)
-        elif (reasons and reasons[0] not in ("already holding", "already traded this token")
-              and self.skips.get(case.mint) != reasons[0]):
+        lock = self._lock(case.mint)
+        if lock.locked():
+            return  # an order for this token is in flight; the next event re-evaluates
+        async with lock:
+            order, reasons = self.strategy.entry(case, self.ledger, self.tracked_set, rel, self.now)
+            if order is not None:
+                await self._execute(order)
+        if (order is None and reasons and reasons[0] not in ("already holding", "already traded this token")
+                and self.skips.get(case.mint) != reasons[0]):
             self.skips[case.mint] = reasons[0]
             if len(case.buyers()) >= 2:
                 self.out(f"    no entry: {reasons[0]}")
@@ -187,11 +219,18 @@ class Engine:
     # -- trading ----------------------------------------------------------
 
     async def _exits(self, case: Case) -> None:
-        for order in self.strategy.exits(case, self.ledger, self.tracked_set, self.now):
-            await self._execute(order)
+        lock = self._lock(case.mint)
+        if lock.locked():
+            return  # an order for this token is in flight; the next event or tick re-evaluates
+        async with lock:
+            for order in self.strategy.exits(case, self.ledger, self.tracked_set, self.now):
+                await self._execute(order)
 
     async def _execute(self, order: Order) -> None:
+        """Callers hold the token's lock."""
         if order.side == "buy":
+            # Mark before submitting: an unclear outcome must never lead to a second buy.
+            self.portfolio.traded_mints.add(order.mint)
             fill = await self.broker.buy(order.mint, order.sol_amount, order.ref_price, self.now, order.reason)
         else:
             fill = await self.broker.sell(order.mint, order.token_amount, order.ref_price, self.now, order.reason)
@@ -206,10 +245,13 @@ class Engine:
         extra = "" if fill.side == "buy" else f" pnl={pnl:+.4f} SOL"
         self.out(f"    ▶ {fill.mode.upper()} {tag} {short(fill.mint)} {fill.sol_amount:.4f} SOL @ "
                  f"{fill.price_sol:.3e}{extra} — {fill.reason}")
-        if fill.side == "buy" and self.on_hold:
-            await self.on_hold(fill.mint)
-        if fill.side == "sell" and fill.mint not in self.portfolio.holdings and self.on_release:
-            await self.on_release(fill.mint)
+        try:
+            if fill.side == "buy" and self.on_hold:
+                await self.on_hold(fill.mint)
+            if fill.side == "sell" and fill.mint not in self.portfolio.holdings and self.on_release:
+                await self.on_release(fill.mint)
+        except Exception:  # noqa: BLE001 - a subscription hiccup must not stop the loop
+            log.exception("price subscription update for %s failed", fill.mint)
 
     def summary(self) -> dict:
         return self.portfolio.summary(self.prices)

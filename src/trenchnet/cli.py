@@ -191,6 +191,7 @@ async def cmd_run(args, cfg: Config) -> None:
     source = PumpPortalSource(cfg.pumpportal, tracked.keys(), api_key)
 
     rpc = None
+    owner = None
     if args.live:
         if not cfg.live.enabled:
             sys.exit("live trading is disabled: set [live] enabled = true in trenchnet.toml")
@@ -206,8 +207,9 @@ async def cmd_run(args, cfg: Config) -> None:
 
         rpc = SolanaRpc(os.environ.get("SOLANA_RPC_URL") or cfg.live.rpc_url)
         kp = Keypair.from_base58_string(key)
+        owner = str(kp.pubkey())
         broker = PumpPortalBroker(cfg, kp, rpc)
-        balance = await rpc.get_balance_sol(str(kp.pubkey()))
+        balance = await rpc.get_balance_sol(owner)
         cfg.paper.starting_balance_sol = balance
         print(f"LIVE trading from {short(str(kp.pubkey()))} (balance {balance:.4f} SOL, "
               f"max {cfg.live.max_position_sol} SOL per buy)")
@@ -220,6 +222,25 @@ async def cmd_run(args, cfg: Config) -> None:
                     background_reports=cfg.llm.background_reports,
                     on_hold=lambda m: source.watch_tokens([m]), on_release=lambda m: source.unwatch_tokens([m]))
     print(f"following {len(tracked)} wallets: {', '.join(t.alias for t in tracked.values())}")
+
+    # Pick up where the last run left off: holdings, traded tokens, today's PnL.
+    engine.restore(store.fills(mode=broker.mode))
+    if rpc is not None and owner is not None:
+        engine.portfolio.cash_sol = cfg.paper.starting_balance_sol  # on-chain balance, not replayed fills
+        for mint, h in list(engine.portfolio.holdings.items()):
+            onchain = await rpc.get_token_balance(owner, mint)
+            if onchain <= 0:
+                print(f"warning: stored holding {short(mint)} has no on-chain balance; dropping it")
+                del engine.portfolio.holdings[mint]
+            elif abs(onchain - h.tokens) > 1e-6 * max(onchain, h.tokens):
+                print(f"note: {short(mint)} on-chain balance {onchain:.0f} differs from records {h.tokens:.0f}; "
+                      "using on-chain")
+                h.cost_sol *= onchain / h.tokens
+                h.tokens = onchain
+    for mint in engine.portfolio.holdings:
+        await source.watch_tokens([mint])
+    if engine.portfolio.holdings:
+        print(f"resumed {len(engine.portfolio.holdings)} open position(s)")
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

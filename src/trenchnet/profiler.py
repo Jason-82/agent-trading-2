@@ -182,8 +182,13 @@ class Profiler:
 
 
 def _alias(i: int) -> str:
-    letters = string.ascii_uppercase
-    return letters[i] if i < 26 else f"{letters[i // 26 - 1]}{letters[i % 26]}"
+    """0 -> A, 25 -> Z, 26 -> AA, ... (bijective base 26, unbounded)."""
+    out = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        out = string.ascii_uppercase[r] + out
+    return out
 
 
 async def build_roster(store: Store, cfg: Config, llm: LLM | None, wallets: list[str] | None = None,

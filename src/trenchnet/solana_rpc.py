@@ -69,7 +69,9 @@ class SolanaRpc:
             return None
         if st.get("err") is not None:
             return False
-        return st.get("confirmationStatus") in ("confirmed", "finalized")
+        if st.get("confirmationStatus") in ("confirmed", "finalized"):
+            return True
+        return None  # "processed": not final yet
 
     async def wait_confirmed(self, signature: str, timeout_s: float) -> bool:
         loop = asyncio.get_running_loop()

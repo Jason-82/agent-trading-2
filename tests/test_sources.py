@@ -4,7 +4,7 @@ from trenchnet.config import load_config
 from trenchnet.models import PriceTick, Side, Trade
 from trenchnet.sources.pumpportal_ws import parse_message
 from trenchnet.sources.replay import read_events, write_events
-from trenchnet.sources.rpc_backfill import TOKEN_ACCOUNT_RENT_SOL, WSOL, parse_wallet_tx
+from trenchnet.sources.rpc_backfill import WSOL, parse_wallet_tx
 
 W = "Wallet111111111111111111111111111111111111"
 MINT = "Mint1111111111111111111111111111111111pump"
@@ -23,14 +23,21 @@ def test_pumpportal_parse_tracked_and_untracked():
     assert parse_message({"txType": "create", "mint": MINT}, {W}, 1.0) == []
 
 
-def _tx(sol_pre, sol_post, pre_tok, post_tok, fee=5000, payer=True):
-    keys = [W, "Other"] if payer else ["Other", W]
-    i = keys.index(W)
-    pre_bal, post_bal = [0, 0], [0, 0]
-    pre_bal[i], post_bal[i] = sol_pre, sol_post
+SPL_RENT = 2_039_280
+T22_RENT = 2_074_080  # Token-2022 account with extensions
+
+
+def _tx(sol_pre, sol_post, pre_tok, post_tok, fee=5000, rent=SPL_RENT):
+    """Token balances are keyed by mint; a mint absent on one side means its
+    token account did not exist then (created or closed in this tx)."""
+    keys = [W, "Other", "AtaMint", "AtaWsol"]
+    acct = {MINT: 2, WSOL: 3, "OtherMint": 1}
+    pre_bal = [sol_pre, 0, rent if MINT in pre_tok else 0, rent if WSOL in pre_tok else 0]
+    post_bal = [sol_post, 0, rent if MINT in post_tok else 0, rent if WSOL in post_tok else 0]
 
     def bal(amounts):
-        return [{"owner": W, "mint": m, "uiTokenAmount": {"uiAmountString": str(a)}} for m, a in amounts.items()]
+        return [{"owner": W, "mint": m, "accountIndex": acct[m], "uiTokenAmount": {"uiAmountString": str(a)}}
+                for m, a in amounts.items()]
 
     return {
         "blockTime": 1_700_000_000,
@@ -41,10 +48,22 @@ def _tx(sol_pre, sol_post, pre_tok, post_tok, fee=5000, payer=True):
 
 
 def test_backfill_buy_excludes_fee_and_rent():
-    rent = int(TOKEN_ACCOUNT_RENT_SOL * 1e9)
-    tx = _tx(10_000_000_000, 10_000_000_000 - 500_000_000 - 5000 - rent, {}, {MINT: 1000})
+    tx = _tx(10_000_000_000, 10_000_000_000 - 500_000_000 - 5000 - SPL_RENT, {}, {MINT: 1000})
     [t] = parse_wallet_tx(tx, W, "S1")
     assert t.side is Side.BUY and t.sol_amount == pytest.approx(0.5) and t.token_amount == 1000
+
+
+def test_backfill_token2022_close_on_transfer_stays_transfer():
+    # Transfer all tokens out and close the Token-2022 account: rent comes back to the wallet.
+    tx = _tx(1_000_000_000, 1_000_000_000 - 5000 + T22_RENT, {MINT: 1000}, {}, rent=T22_RENT)
+    [t] = parse_wallet_tx(tx, W, "S6")
+    assert t.side is Side.TRANSFER_OUT and t.sol_amount == 0
+
+
+def test_backfill_small_tip_does_not_make_a_transfer_a_trade():
+    tx = _tx(1_000_000_000, 1_000_000_000 - 5000 - 100_000, {MINT: 0}, {MINT: 1000})
+    [t] = parse_wallet_tx(tx, W, "S7")
+    assert t.side is Side.TRANSFER_IN
 
 
 def test_backfill_sell_via_wsol_and_transfer():
@@ -57,7 +76,7 @@ def test_backfill_sell_via_wsol_and_transfer():
 
 
 def test_backfill_skips_multi_token_and_failed():
-    tx = _tx(1_000_000_000, 900_000_000, {}, {MINT: 10, "Other": 5})
+    tx = _tx(1_000_000_000, 900_000_000, {}, {MINT: 10, "OtherMint": 5})
     assert parse_wallet_tx(tx, W, "S4") == []
     tx["meta"]["err"] = {"InstructionError": [0, "x"]}
     assert parse_wallet_tx(tx, W, "S5") == []
