@@ -100,20 +100,26 @@ class Position:
             self.n_sells += 1
             if self.first_sell_ts is None:
                 self.first_sell_ts = t.ts
-            if self._is_dust():
+            if self._is_dust() and self.closed_ts is None:
                 self._close(t.ts, by_transfer=False)
         elif t.side is Side.TRANSFER_OUT:
             q = min(t.token_amount, self.tokens)
+            removed = 0.0
             if self.tokens > 0 and q > 0:
                 # Cost basis leaves with the tokens, proportionally.
                 frac = q / self.tokens
-                self.cost_sol -= self.cost_sol * frac
+                removed = self.cost_sol * frac
+                self.cost_sol -= removed
                 self.basis_tokens -= self.basis_tokens * frac
                 self.tokens -= q
             self.transferred_out += t.token_amount
             if self._is_dust() and self.closed_ts is None:
-                # Leftovers sent away or burned after selling most of it: the trade is over.
-                self._close(t.ts, by_transfer=self.sold_fraction < 0.9)
+                # Leftovers sent away or burned after selling most of it: the trade is over,
+                # and what those leftovers cost is part of its result.
+                by_transfer = self.sold_fraction < 0.9
+                if not by_transfer:
+                    self.realized_pnl_sol -= removed
+                self._close(t.ts, by_transfer=by_transfer)
         elif t.side is Side.TRANSFER_IN:
             self.tokens += t.token_amount
             self.transferred_in += t.token_amount
@@ -127,12 +133,12 @@ class Position:
         return self.tokens <= self._dust()
 
     def _close(self, ts: float, by_transfer: bool) -> None:
-        # Write off the (negligible) cost of dust left behind by a sale.
-        if not by_transfer and self.basis_tokens > 0:
+        # A sale that leaves only dust ends the trade: write off what the dust cost. The dust
+        # itself stays in the balance (at zero cost), so selling it later counts as profit,
+        # not as tokens sold without an observed buy, and a re-entry adds to it.
+        if not by_transfer:
             self.realized_pnl_sol -= self.cost_sol
-        self.tokens = 0.0
-        self.basis_tokens = 0.0
-        self.cost_sol = 0.0
+            self.cost_sol = 0.0
         self.closed_ts = ts
         self.closed_by_transfer = by_transfer
 

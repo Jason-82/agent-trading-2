@@ -34,6 +34,10 @@ class Trade:
     market_cap_sol: float | None = None
     price_sol: float | None = None  # SOL per token; derived from amounts when absent
     source: str = "unknown"
+    # Paid for / sold for a stablecoin instead of SOL: which one and how much. sol_amount then
+    # holds its value in SOL at the time of the trade.
+    quote_mint: str | None = None
+    quote_amount: float | None = None
 
     @property
     def price(self) -> float | None:
@@ -65,6 +69,8 @@ class Trade:
             market_cap_sol=_opt_float(d.get("market_cap_sol")),
             price_sol=_opt_float(d.get("price_sol")),
             source=str(d.get("source") or "unknown"),
+            quote_mint=d.get("quote_mint") or None,
+            quote_amount=_opt_float(d.get("quote_amount")),
         )
 
 

@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS trades (
     market_cap_sol REAL,
     price_sol REAL,
     source TEXT,
+    quote_mint TEXT,
+    quote_amount REAL,
     PRIMARY KEY (signature, wallet, mint, side)
 );
 CREATE INDEX IF NOT EXISTS trades_wallet_ts ON trades(wallet, ts);
@@ -71,6 +73,12 @@ CREATE TABLE IF NOT EXISTS prices (
     ts REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sol_usd (
+    bucket INTEGER PRIMARY KEY,  -- start of a 5-minute candle, unix seconds
+    price REAL NOT NULL,
+    source TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS fills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mint TEXT NOT NULL,
@@ -93,23 +101,62 @@ class Store:
         self.db = sqlite3.connect(self.path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring a database made by an older version up to date."""
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(trades)")}
+        for name, kind in (("quote_mint", "TEXT"), ("quote_amount", "REAL")):
+            if name not in cols:
+                self.db.execute(f"ALTER TABLE trades ADD COLUMN {name} {kind}")
+        self.db.commit()
 
     def close(self) -> None:
         self.db.close()
 
     # -- trades -------------------------------------------------------------
 
+    _INSERT = ("INSERT OR IGNORE INTO trades (signature, wallet, mint, side, sol_amount, token_amount, ts,"
+               " market_cap_sol, price_sol, source, quote_mint, quote_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+
+    @staticmethod
+    def _row(t: Trade) -> tuple:
+        return (t.signature, t.wallet, t.mint, t.side.value, t.sol_amount, t.token_amount, t.ts,
+                t.market_cap_sol, t.price_sol, t.source, t.quote_mint, t.quote_amount)
+
     def add_trades(self, trades: Iterable[Trade]) -> int:
-        cur = self.db.executemany(
-            "INSERT OR IGNORE INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)",
-            [
-                (t.signature, t.wallet, t.mint, t.side.value, t.sol_amount, t.token_amount, t.ts,
-                 t.market_cap_sol, t.price_sol, t.source)
-                for t in trades
-            ],
-        )
+        cur = self.db.executemany(self._INSERT, [self._row(t) for t in trades])
         self.db.commit()
         return cur.rowcount
+
+    def replace_trades(self, wallet: str, trades: Iterable[Trade], signatures: Iterable[str],
+                       source: str = "rpc") -> tuple[int, int]:
+        """Save a fresh reading of some of a wallet's transactions. Stored rows
+        from `source` for those signatures are replaced by `trades`, all in one
+        database transaction; rows for other signatures (older history, trades
+        seen live) are untouched.
+
+        Returns (rows that weren't stored before, old rows that are gone because
+        the transaction now reads differently)."""
+        trades = list(trades)
+        sigs = sorted(set(signatures) | {t.signature for t in trades})
+        old: set[tuple] = set()
+        with self.db:
+            for i in range(0, len(sigs), 500):  # stay under SQLite's limit on query parameters
+                chunk = sigs[i:i + 500]
+                where = f"wallet = ? AND source = ? AND signature IN ({','.join('?' * len(chunk))})"
+                args = [wallet, source, *chunk]
+                old |= {tuple(r) for r in self.db.execute(
+                    f"SELECT signature, wallet, mint, side FROM trades WHERE {where}", args)}
+                self.db.execute(f"DELETE FROM trades WHERE {where}", args)
+            inserted = self.db.executemany(self._INSERT, [self._row(t) for t in trades]).rowcount
+        new_keys = {t.key for t in trades}
+        return inserted - len(old & new_keys), len(old - new_keys)
+
+    def traded_mints(self, wallet: str) -> set[str]:
+        """Tokens the wallet bought or sold in the stored history."""
+        return {r[0] for r in self.db.execute(
+            "SELECT DISTINCT mint FROM trades WHERE wallet = ? AND side IN ('buy', 'sell')", (wallet,))}
 
     def add_trade(self, t: Trade) -> bool:
         return self.add_trades([t]) > 0
@@ -149,6 +196,7 @@ class Store:
             signature=r["signature"], wallet=r["wallet"], mint=r["mint"], side=Side(r["side"]),
             sol_amount=r["sol_amount"], token_amount=r["token_amount"], ts=r["ts"],
             market_cap_sol=r["market_cap_sol"], price_sol=r["price_sol"], source=r["source"] or "unknown",
+            quote_mint=r["quote_mint"], quote_amount=r["quote_amount"],
         )
 
     # -- roster -------------------------------------------------------------
@@ -241,6 +289,16 @@ class Store:
             if t.price is not None and (best is None or t.ts > best[1]):
                 best = (t.price, t.ts)
         return best
+
+    # -- SOL/USD candles (for trades priced in stablecoins) -----------------
+
+    def save_sol_usd(self, rows: Iterable[tuple[int, float, str]]) -> None:
+        self.db.executemany("INSERT OR REPLACE INTO sol_usd VALUES (?,?,?)", list(rows))
+        self.db.commit()
+
+    def sol_usd(self, lo: int, hi: int) -> dict[int, float]:
+        return {r[0]: r[1] for r in self.db.execute(
+            "SELECT bucket, price FROM sol_usd WHERE bucket BETWEEN ? AND ?", (lo, hi))}
 
     # -- fills --------------------------------------------------------------
 

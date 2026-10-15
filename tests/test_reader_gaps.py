@@ -147,8 +147,9 @@ def test_refresh_replaces_downloaded_history(tmp_path, monkeypatch):
     store.close()
     (tmp_path / "w.txt").write_text(f"{w}\n")
 
-    async def fake_backfill(rpc, wallet, max_signatures=500, progress=None, retry_pause_s=10.0, result=None):
+    async def fake_backfill(rpc, wallet, max_signatures=500, result=None, **kw):
         result.trades.append(Trade("old", w, COIN, Side.SELL, 0.5, 1000, 6, source="rpc"))
+        result.read.add("old")
         result.transactions = 1
         return result
 

@@ -212,7 +212,10 @@ def _wallet_summary(res) -> str:
     transfers = sides[Side.TRANSFER_IN] + sides[Side.TRANSFER_OUT]
     if transfers:
         parts.append(f"{transfers} transfers")
+    in_stable = sum(1 for t in res.trades if t.quote_mint)
     text = f"{', '.join(parts)} from {res.transactions} transactions"
+    if in_stable:
+        text += f" ({in_stable} of the trades paid in USDC/stablecoins)"
     if res.ignored and (not res.trades or sum(res.ignored.values()) > len(res.trades)):
         why = "; ".join(f"{c} {SKIP_REASONS.get(r, r).split(' (')[0]}" for r, c in res.ignored.most_common(2))
         text += f" [skipped: {why}]"
@@ -240,6 +243,7 @@ def _rpc_from(url: str, rps: float | None = None):
 
 
 async def cmd_backfill(args, cfg: Config) -> None:
+    from .prices import SolUsdPrices
     from .solana_rpc import RpcError, RpcHTTPError
     from .sources.rpc_backfill import BackfillResult, backfill_wallet
 
@@ -259,22 +263,35 @@ async def cmd_backfill(args, cfg: Config) -> None:
             await rpc.aclose()
             print(f"Nothing to do. Next: {_cmd('profile --wallets ' + shlex.quote(args.wallets), cfg)}")
             return
-    total_new = 0
+    prices = SolUsdPrices(store)
+    total_new = total_fixed = unpriced = 0
     done_wallets = 0
     skipped: list[str] = []
     failures_in_a_row = 0
     stop: RpcHTTPError | None = None
+
+    def save(w: str, res: BackfillResult) -> tuple[int, int]:
+        # The transactions read this time replace what was saved for them before (an older
+        # reader may have read them differently); older history and live trades are kept.
+        nonlocal total_new, total_fixed, unpriced
+        new, fixed = store.replace_trades(w, res.trades, res.read)
+        total_new += new
+        total_fixed += fixed
+        unpriced += res.unpriced
+        return new, fixed
+
     try:
         for i, w in enumerate(wallets, 1):
             label = f"[{i}/{len(wallets)}] {short(w)}"
             res = BackfillResult()
             try:
                 await backfill_wallet(
-                    rpc, w, max_signatures=args.limit, result=res,
+                    rpc, w, max_signatures=args.limit, result=res, prices=prices,
+                    known_traded=store.traded_mints(w),
                     progress=lambda d, t, n, label=label: PROGRESS.show(
                         f"{label}: {d}/{t} transactions read, {n} trades found"))
             except (RpcHTTPError, RpcError) as e:
-                total_new += store.add_trades(res.trades)
+                save(w, res)
                 if isinstance(e, RpcHTTPError) and e.fatal:
                     stop = e
                     break
@@ -287,18 +304,15 @@ async def cmd_backfill(args, cfg: Config) -> None:
                     break
                 continue
             except asyncio.CancelledError:  # Ctrl-C: keep what this wallet has so far, then stop
-                n = store.add_trades(res.trades)
+                n, _ = save(w, res)
                 PROGRESS.end()
-                print(f"Stopped. Saved {total_new + n} new trades, including {n} from the wallet in progress. "
+                print(f"Stopped. Saved {total_new} new trades, including {n} from the wallet in progress. "
                       f"Run the same command again to continue.", file=sys.stderr)
                 raise
             failures_in_a_row = 0
             done_wallets += 1
-            if args.refresh and res.stopped is None:  # complete re-read: replace, so reclassified trades don't duplicate
-                store.delete_trades(w, source="rpc")
-            n = store.add_trades(res.trades)
-            total_new += n
-            line = f"{label}: {_wallet_summary(res)} ({n} new)"
+            n, fixed = save(w, res)
+            line = f"{label}: {_wallet_summary(res)} ({n} new" + (f", {fixed} earlier entries corrected" if fixed else "") + ")"
             if res.unreadable:
                 why = ", ".join(f"{c} {r}" for r, c in res.unreadable.most_common())
                 line += f"; {sum(res.unreadable.values())} unreadable ({why})"
@@ -310,7 +324,12 @@ async def cmd_backfill(args, cfg: Config) -> None:
     finally:
         PROGRESS.end()
         await rpc.aclose()
-    print(f"{total_new} new trades saved to {cfg.db_path}.")
+        await prices.aclose()
+    print(f"{total_new} new trades saved to {cfg.db_path}."
+          + (f" {total_fixed} earlier entries were read differently this time and were corrected." if total_fixed else ""))
+    if unpriced:
+        print(f"{unpriced} trades paid in USDC/stablecoins were left out: "
+              f"{prices.problem or 'no SOL/USD price for their time'}. Run the same command again later to add them.")
     if skipped:
         print(f"{len(skipped)} wallet(s) were skipped because their transactions couldn't be listed; "
               "run the same command again later to retry them.")
@@ -361,25 +380,30 @@ _SHORT_SKIP = {
     "several_tokens": "2+ tokens changed",
     "no_time": "no block time",
     "unreadable": "could not read",
-    "quote_conversion": "stablecoin swap",
-    "other_quote": "priced in USDC/USD1",
+    "quote_conversion": "only SOL/stablecoins",
+    "other_quote": "USDC trade, no SOL price",
 }
 
 
 async def cmd_inspect(args, cfg: Config) -> None:
+    from .prices import SolUsdPrices
     from .solana_rpc import RpcError, RpcHTTPError
-    from .sources.rpc_backfill import analyze_wallet_tx, fetch_transaction
+    from .sources.rpc_backfill import QUOTE_MINTS, analyze_wallet_tx, fetch_transaction, list_wallet_signatures, \
+        value_in_sol
 
     wallet = _resolve_wallet(args.wallet, cfg)
     rpc = _rpc_from(args.rpc or os.environ.get("SOLANA_RPC_URL") or cfg.live.rpc_url)
+    store = Store(cfg.db_path) if cfg.db_path == ":memory:" or Path(cfg.db_path).exists() else None
+    prices = SolUsdPrices(store)
     counts: Counter = Counter()
     examples: dict[str, list[str]] = {}
     try:
         try:
-            sigs = await rpc.get_signatures(wallet, limit=args.limit)
+            sigs = await list_wallet_signatures(rpc, wallet, args.limit, retry_pause_s=2.0, successful_only=False)
         except (RpcHTTPError, RpcError) as e:
             sys.exit(f"Could not list the wallet's transactions: {e}")
-        print(f"Wallet {wallet}: its last {len(sigs)} transactions, newest first (read from {rpc.host})\n")
+        print(f"Wallet {wallet}: its last {len(sigs)} transactions (including its USDC account's), newest first "
+              f"(read from {rpc.host})\n")
         print(f"{'time (UTC)':<17}  {'read as':<27} {'SOL change':>11}  token changes (wallet-owned)")
         for s in sigs:
             sig = s["signature"]
@@ -394,17 +418,28 @@ async def cmd_inspect(args, cfg: Config) -> None:
                 else:
                     kind = view.trade.side.value.upper().replace("_", " ") if view.trade is not None else view.status
                     sol = f"{view.sol_delta:+.4f}"
-                    tokens = ", ".join(f"{short(m)} {d:+,.6g}" for m, d in list(view.token_deltas.items())[:3])
+                    names = {m: QUOTE_MINTS.get(m) or short(m) for m in view.token_deltas}
+                    tokens = ", ".join(f"{names[m]} {d:+,.6g}" for m, d in list(view.token_deltas.items())[:3])
                     if len(view.token_deltas) > 3:
                         tokens += f", +{len(view.token_deltas) - 3} more"
-            counts[kind] += 1
-            examples.setdefault(kind, [])
-            if len(examples[kind]) < 2:
-                examples[kind].append(sig)
+                    if view.pending is not None:
+                        t = view.pending
+                        price = await prices.price_at(t.ts)
+                        kind = f"{t.side.value.upper()} in {QUOTE_MINTS[t.quote_mint or '']}"
+                        if price:
+                            kind += f" ={value_in_sol(view, price).sol_amount:.3f} SOL"
+                        else:
+                            kind = "other_quote"
+            key = kind.split(" in ")[0]  # "BUY in USDC =0.712 SOL" counts as a BUY
+            counts[key] += 1
+            examples.setdefault(key, [])
+            if len(examples[key]) < 2:
+                examples[key].append(sig)
             label = kind if kind not in _SHORT_SKIP else "skipped: " + _SHORT_SKIP[kind]
             print(f"{when[:16]:<17}  {label:<27} {sol:>11}  {tokens}")
     finally:
         await rpc.aclose()
+        await prices.aclose()
 
     print("\nSummary: " + ", ".join(f"{c} {_SHORT_SKIP.get(k, k.lower())}" for k, c in counts.most_common()))
     traded = sum(c for k, c in counts.items() if k in ("BUY", "SELL"))
@@ -419,8 +454,8 @@ async def cmd_inspect(args, cfg: Config) -> None:
             continue
         for sig in sigs_:
             print(f"  {_SHORT_SKIP.get(kind, kind.lower())}: https://solscan.io/tx/{sig}")
-    if cfg.db_path == ":memory:" or Path(cfg.db_path).exists():
-        stored = Counter(t.side.value for t in Store(cfg.db_path).trades(wallets=[wallet]))
+    if store is not None:
+        stored = Counter(t.side.value for t in store.trades(wallets=[wallet]))
         if stored:
             print("Saved in the database for this wallet: " + ", ".join(f"{c} {k}" for k, c in stored.most_common()))
 
@@ -681,6 +716,16 @@ def _positive_rate(text: str) -> float:
     return v
 
 
+def _positive_int(text: str) -> int:
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if n <= 0:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return n
+
+
 def _nonneg_int(text: str) -> int:
     v = int(text)
     if v < 0:
@@ -727,14 +772,15 @@ def main(argv: list[str] | None = None) -> None:
 
     s = command("backfill", help="backfill wallet history from a Solana RPC")
     s.add_argument("wallets", help="file with one address[,alias] per line")
-    s.add_argument("--limit", type=int, default=500, help="max signatures per wallet")
+    s.add_argument("--limit", type=_positive_int, default=500,
+                   help="how many recent transactions to read per wallet (default 500)")
     s.add_argument("--rpc", help="RPC URL (default: $SOLANA_RPC_URL or [live].rpc_url)")
     s.add_argument("--rps", type=_positive_rate, default=None,
                    help="max requests per second (default 5, or 3 on Solana's public RPC)")
     group = s.add_mutually_exclusive_group()
     group.add_argument("--new-only", action="store_true", help="skip wallets that already have trades saved")
-    group.add_argument("--refresh", action="store_true",
-                       help="re-read every wallet and replace its downloaded history (after a reader update)")
+    # Every run now replaces what it re-reads; kept so older instructions still work.
+    group.add_argument("--refresh", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_backfill)
 
     s = command("inspect", help="show how a wallet's recent transactions are read (buy/sell/skipped and why)")
