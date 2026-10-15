@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 from .models import Side, Trade
 
-DUST_FRACTION = 1e-3
+DUST_FRACTION = 1e-2  # below 1% of the peak holding counts as fully exited
 
 
 @dataclass
@@ -112,7 +112,8 @@ class Position:
                 self.tokens -= q
             self.transferred_out += t.token_amount
             if self._is_dust() and self.closed_ts is None:
-                self._close(t.ts, by_transfer=True)
+                # Leftovers sent away or burned after selling most of it: the trade is over.
+                self._close(t.ts, by_transfer=self.sold_fraction < 0.9)
         elif t.side is Side.TRANSFER_IN:
             self.tokens += t.token_amount
             self.transferred_in += t.token_amount

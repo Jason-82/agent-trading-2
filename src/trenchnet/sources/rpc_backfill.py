@@ -40,7 +40,28 @@ from ..solana_rpc import VERSION_UNSUPPORTED, LAMPORTS_PER_SOL, RpcError, RpcHTT
 log = logging.getLogger(__name__)
 
 WSOL = "So11111111111111111111111111111111111111112"
-MIN_SOL_MOVE = 0.001
+MIN_SOL_MOVE = 0.001  # a buy must spend at least this much SOL (else it's a transfer in)
+MIN_SELL_PROCEEDS = 0.0001  # without a known swap program, smaller "proceeds" are rent noise on a transfer
+MAX_SIGNATURE_PAGES = 10  # up to 10,000 signatures listed per wallet (failed ones are skipped)
+
+# Stablecoins used as the price currency instead of SOL (pump.fun USDC pairs since May 2026, USD1 pairs, ...).
+QUOTE_MINTS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
+    "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB": "USD1",
+}
+
+# Swap programs: a token decrease in a transaction that calls one of these is a sale even when the
+# proceeds are nil (rugged coin) or eaten by tips; without them it would look like a transfer.
+SWAP_PROGRAMS = {
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # pump.fun bonding curve
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",  # PumpSwap
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",  # Jupiter v6
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",  # Raydium CPMM
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  # Raydium CLMM
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",  # Meteora DLMM
+}
 
 
 def _key(k: Any) -> str:
@@ -81,8 +102,22 @@ def _token_amounts(balances: list[dict] | None, owner: str) -> dict[str, float]:
     return out
 
 
-def _owned_accounts(balances: list[dict] | None, owner: str) -> set[int]:
-    return {b["accountIndex"] for b in balances or [] if b.get("owner") == owner and "accountIndex" in b}
+def _owned_accounts(balances: list[dict] | None, owner: str) -> dict[int, tuple[str, float]]:
+    """accountIndex -> (mint, token amount) for the owner's token accounts."""
+    out: dict[int, tuple[str, float]] = {}
+    for b in balances or []:
+        if b.get("owner") == owner and "accountIndex" in b:
+            amt = b.get("uiTokenAmount") or {}
+            out[b["accountIndex"]] = (b["mint"], float(amt.get("uiAmountString") or amt.get("uiAmount") or 0))
+    return out
+
+
+def _rent(lamports: int, account: tuple[str, float]) -> float:
+    """Rent part of a token account's lamports. A wrapped-SOL account's
+    lamports also hold the wrapped SOL itself, which is counted separately."""
+    mint, amount = account
+    sol = lamports / LAMPORTS_PER_SOL
+    return max(0.0, sol - amount) if mint == WSOL else sol
 
 
 # Why a transaction produced no trade, in plain words (used in summaries and `trenchnet inspect`).
@@ -93,6 +128,8 @@ SKIP_REASONS = {
     "several_tokens": "several tokens changed at once (multi-token swap or batch)",
     "no_time": "no block time",
     "unrelated_transfer": "tokens received or sent that the wallet never bought or sold (usually spam airdrops)",
+    "quote_conversion": "SOL swapped to or from a stablecoin (not a token trade)",
+    "other_quote": "token bought or sold with USDC/USDT/USD1 instead of SOL (not counted yet)",
 }
 
 
@@ -141,8 +178,8 @@ def analyze_wallet_tx(tx: dict | None, wallet: str, signature: str) -> TxView:
     # pay to create the token account they drop tokens into.
     pre_accts = _owned_accounts(meta.get("preTokenBalances"), wallet)
     post_accts = _owned_accounts(meta.get("postTokenBalances"), wallet)
-    created = sum(meta["postBalances"][idx] for idx in post_accts - pre_accts) / LAMPORTS_PER_SOL
-    closed = sum(meta["preBalances"][idx] for idx in pre_accts - post_accts) / LAMPORTS_PER_SOL
+    created = sum(_rent(meta["postBalances"][i], post_accts[i]) for i in post_accts.keys() - pre_accts.keys())
+    closed = sum(_rent(meta["preBalances"][i], pre_accts[i]) for i in pre_accts.keys() - post_accts.keys())
     if created and native <= -created + 1e-9:  # the wallet paid to open its token account
         sol_delta += created
     if closed and native >= closed - 1e-9:  # the refund from closing it came back to the wallet
@@ -152,14 +189,29 @@ def analyze_wallet_tx(tx: dict | None, wallet: str, signature: str) -> TxView:
     deltas = {m: d for m, d in deltas.items() if abs(d) > 0}
     if not deltas:
         return TxView("no_token_change", sol_delta)
-    if len(deltas) > 1:
+    coins = {m: d for m, d in deltas.items() if m not in QUOTE_MINTS}
+    quotes = {m: d for m, d in deltas.items() if m in QUOTE_MINTS}
+    if not coins:  # SOL <-> stablecoin: not a token trade, never a position
+        return TxView("quote_conversion", sol_delta, deltas)
+    if len(coins) > 1:
         return TxView("several_tokens", sol_delta, deltas)
-    mint, d = next(iter(deltas.items()))
+    mint, d = next(iter(coins.items()))
+    swap = not SWAP_PROGRAMS.isdisjoint(keys)
 
-    if d > 0 and sol_delta < -MIN_SOL_MOVE:
+    paid_sol = d > 0 and (sol_delta < -MIN_SOL_MOVE or (swap and sol_delta < -1e-6))
+    # With a swap program, a sale can net nothing or even a little less than nothing (tips);
+    # putting real SOL in alongside the token (e.g. adding liquidity) is not a sale.
+    got_sol = d < 0 and (sol_delta > MIN_SELL_PROCEEDS or (swap and sol_delta > -0.01))
+    if quotes and not (paid_sol or (d < 0 and sol_delta > MIN_SOL_MOVE)):
+        # The coin was paid for / sold for a stablecoin, not SOL (a small stablecoin
+        # residual next to a real SOL payment is ignored).
+        status = "other_quote" if len(quotes) == 1 and next(iter(quotes.values())) * d < 0 else "several_tokens"
+        return TxView(status, sol_delta, deltas)
+
+    if paid_sol:
         side, sol = Side.BUY, -sol_delta
-    elif d < 0 and sol_delta > MIN_SOL_MOVE:
-        side, sol = Side.SELL, sol_delta
+    elif got_sol:
+        side, sol = Side.SELL, max(sol_delta, 0.0)  # a rugged coin can sell for nothing
     elif d > 0:
         side, sol = Side.TRANSFER_IN, 0.0
     else:
@@ -236,15 +288,20 @@ async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500
     res = result if result is not None else BackfillResult()
     sigs: list[str] = []
     before = None
-    while len(sigs) < max_signatures:
-        page = await _list_signatures(rpc, wallet, min(1000, max_signatures - len(sigs)), before, retry_pause_s)
+    for _ in range(MAX_SIGNATURE_PAGES):
+        if len(sigs) >= max_signatures:
+            break
+        # Always a full page: failed transactions are dropped below, so asking for
+        # "what's left" would end the listing early on wallets with many failures.
+        page = await _list_signatures(rpc, wallet, 1000, before, retry_pause_s)
         if not page:
             break
         sigs += [s["signature"] for s in page if s.get("err") is None]
         before = page[-1]["signature"]
-        if len(page) < 1000:
+        if len(page) < 1000:  # end of the wallet's history
             break
     sigs = sigs[:max_signatures]
+    newest_first = {s: i for i, s in enumerate(sigs)}
     warned: set[str] = set()
 
     async def read(batch: list[str], show_progress: bool) -> dict[str, Exception]:
@@ -296,5 +353,8 @@ async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500
             failed.pop(s)
         failed.update(await read(transient, show_progress=False))
     res.unreadable = Counter(_reason(e) for e in failed.values())
+    # Oldest first, keeping on-chain order within the same second (a buy and a sell
+    # in one second must replay buy-then-sell).
+    res.trades.sort(key=lambda t: (t.ts, -newest_first.get(t.signature, 0)))
     drop_unrelated_transfers(res)
     return res

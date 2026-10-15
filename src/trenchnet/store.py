@@ -132,6 +132,11 @@ class Store:
         q += " ORDER BY ts, rowid"
         return [self._row_to_trade(r) for r in self.db.execute(q, args)]
 
+    def delete_trades(self, wallet: str, source: str) -> int:
+        cur = self.db.execute("DELETE FROM trades WHERE wallet = ? AND source = ?", (wallet, source))
+        self.db.commit()
+        return cur.rowcount
+
     def wallet_trade_counts(self) -> dict[str, int]:
         return {r[0]: r[1] for r in self.db.execute("SELECT wallet, COUNT(*) FROM trades GROUP BY wallet")}
 

@@ -86,7 +86,9 @@ stop, and records the "A buys then sells immediately" case without analysis.
    line in `wallets.txt` that isn't a wallet address. If it stops early
    (credits used up, provider down) the trades read so far are kept; run the
    same command again later and already-saved trades are skipped. Add
-   `--new-only` to download only wallets you haven't downloaded before.
+   `--new-only` to download only wallets you haven't downloaded before, or
+   `--refresh` to re-read every wallet and replace its downloaded history
+   (worth doing after an update to the reader).
    `trenchnet inspect <wallet or nickname>` shows, transaction by transaction,
    what the reader made of a wallet's recent activity.
    Or import your own data: `trenchnet import trades.jsonl` (format in

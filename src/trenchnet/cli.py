@@ -294,6 +294,8 @@ async def cmd_backfill(args, cfg: Config) -> None:
                 raise
             failures_in_a_row = 0
             done_wallets += 1
+            if args.refresh and res.stopped is None:  # complete re-read: replace, so reclassified trades don't duplicate
+                store.delete_trades(w, source="rpc")
             n = store.add_trades(res.trades)
             total_new += n
             line = f"{label}: {_wallet_summary(res)} ({n} new)"
@@ -359,6 +361,8 @@ _SHORT_SKIP = {
     "several_tokens": "2+ tokens changed",
     "no_time": "no block time",
     "unreadable": "could not read",
+    "quote_conversion": "stablecoin swap",
+    "other_quote": "priced in USDC/USD1",
 }
 
 
@@ -727,7 +731,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--rpc", help="RPC URL (default: $SOLANA_RPC_URL or [live].rpc_url)")
     s.add_argument("--rps", type=_positive_rate, default=None,
                    help="max requests per second (default 5, or 3 on Solana's public RPC)")
-    s.add_argument("--new-only", action="store_true", help="skip wallets that already have trades saved")
+    group = s.add_mutually_exclusive_group()
+    group.add_argument("--new-only", action="store_true", help="skip wallets that already have trades saved")
+    group.add_argument("--refresh", action="store_true",
+                       help="re-read every wallet and replace its downloaded history (after a reader update)")
     s.set_defaults(fn=cmd_backfill)
 
     s = command("inspect", help="show how a wallet's recent transactions are read (buy/sell/skipped and why)")
