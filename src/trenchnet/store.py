@@ -245,6 +245,11 @@ class Store:
         )
         self.db.commit()
 
+    def clear_fills(self, mode: str) -> int:
+        cur = self.db.execute("DELETE FROM fills WHERE mode = ?", (mode,))
+        self.db.commit()
+        return cur.rowcount
+
     def fills(self, mode: str | None = None) -> list[dict[str, Any]]:
         q, args = "SELECT * FROM fills", []
         if mode:

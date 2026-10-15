@@ -7,13 +7,13 @@ from typing import Protocol
 @dataclass(frozen=True)
 class Fill:
     mint: str
-    side: str  # "buy" | "sell"
+    side: str  # "buy" | "sell" | "reconcile" (token_amount = on-chain balance found; no SOL moved)
     sol_amount: float  # SOL spent incl. fees (buy) / received net of fees (sell)
     token_amount: float
     price_sol: float  # effective execution price
     fee_sol: float
     ts: float
-    mode: str  # "paper" | "live"
+    mode: str  # "paper" (trenchnet run) | "live" | "backtest" (replay, demo)
     reason: str
     tx_signature: str | None = None
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sqlite3
 from dataclasses import fields
 from typing import Awaitable, Callable, Iterable
 
@@ -183,10 +184,14 @@ class Engine:
     def save_marks(self) -> None:
         """Persist the latest price of each held token so `trenchnet pnl` can
         value open positions while the bot is stopped."""
-        for mint in self.portfolio.holdings:
-            case = self.cases.get(mint)
-            if case is not None and case.last_price is not None:
-                self.store.save_price(mint, case.last_price, case.last_price_ts or self.now)
+        try:
+            for mint in self.portfolio.holdings:
+                case = self.cases.get(mint)
+                if case is not None and case.last_price is not None:
+                    self.store.save_price(mint, case.last_price, case.last_price_ts or self.now)
+        except sqlite3.Error as e:  # e.g. the database is locked by another program; try again next tick
+            self.store.db.rollback()
+            log.warning("could not save last prices (%s)", e)
 
     # -- reports ----------------------------------------------------------
 

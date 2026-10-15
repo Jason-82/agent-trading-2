@@ -97,7 +97,13 @@ stop, and records the "A buys then sells immediately" case without analysis.
    open positions valued at the last price the bot saw. Everything is in SOL,
    so a positive number means the bot beat simply holding SOL. Paper and live
    trades are reported separately.
-6. **Backtest** recorded events: `trenchnet replay events.jsonl`.
+
+   To stop `trenchnet run`, press Ctrl-C once: it finishes what it is doing
+   (an order being confirmed is recorded), prints a summary and exits. Press
+   Ctrl-C a second time only if you need to quit immediately.
+6. **Backtest** recorded events: `trenchnet replay events.jsonl`. Backtest
+   trades are kept apart from paper and live results (each replay replaces
+   the previous one); see them with `trenchnet pnl --mode backtest`.
 
 Everything the bot records (trades, roster, reports, its own fills) is in
 `trenchnet.db` in the folder you run it from. Every command accepts

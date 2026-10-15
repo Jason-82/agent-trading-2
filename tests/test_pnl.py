@@ -87,6 +87,9 @@ def test_last_price_prefers_newest_source():
     assert s.last_price("M") == (5e-3, 200.0)
     s.save_price("M", 9e-3, 150.0)  # older than what we have: ignored
     assert s.last_price("M") == (5e-3, 200.0)
+    # A tracked trade after the last saved mark (e.g. the bot was killed between ticks) wins.
+    s.add_trade(Trade("sig2", "w2", "M", Side.SELL, 2.0, 100, 300.0))
+    assert s.last_price("M") == (pytest.approx(2e-2), 300.0)
     assert s.last_price("unknown") is None
 
 
@@ -123,7 +126,7 @@ def test_cli_pnl_empty_db(tmp_path):
     Store(db).close()
     with pytest.raises(SystemExit) as e:
         main(["pnl", "--db", db])
-    assert "no trades recorded" in str(e.value.code)
+    assert "no paper or live trades recorded" in str(e.value.code)
 
 
 async def test_engine_saves_marks_for_held_tokens():

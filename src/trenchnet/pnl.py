@@ -23,12 +23,13 @@ _UNIT_S = {"m": 60, "min": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
 
 
 def parse_since(text: str, now: float) -> float:
-    """'90m', '24h', '7d', '2w' (relative to now) or a UTC date 'YYYY-MM-DD'."""
+    """'90m', '24h', '7d', '2w' (relative to now) or a UTC date 'YYYY-MM-DD'.
+    Never earlier than 1970 (Windows can't format negative timestamps)."""
     m = _DURATION.match(text)
     if m:
-        return now - float(m.group(1)) * _UNIT_S[m.group(2).lower()]
+        return max(0.0, now - float(m.group(1)) * _UNIT_S[m.group(2).lower()])
     try:
-        return datetime.strptime(text.strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+        return max(0.0, datetime.strptime(text.strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
     except ValueError:
         raise ValueError(f"can't read --since {text!r}: use e.g. 24h, 7d, 2w or 2026-10-01") from None
 
@@ -73,18 +74,32 @@ class OpenPosition:
 
 
 @dataclass
+class Reconciliation:
+    """The wallet held a different amount than the bot's records (e.g. a sale
+    landed but its result was never confirmed). Proceeds are unknown, so it
+    is reported separately and never counted as a win or loss."""
+
+    mint: str
+    ts: float
+    records_tokens: float
+    onchain_tokens: float
+    cost_removed_sol: float
+
+
+@dataclass
 class PnlReport:
     mode: str
     since: float | None
     now: float
     realized_sol: float = 0.0
-    fees_sol: float = 0.0
+    fees_sol: float = 0.0  # live: buy-side only, sell fees are netted out of proceeds
     n_fills: int = 0
     n_buys: int = 0
     deployed_sol: float = 0.0  # SOL spent on buys in the window
     closed: list[ClosedTrade] = field(default_factory=list)  # exited in the window, oldest first
     by_day: list[tuple[str, float, int]] = field(default_factory=list)  # (UTC day, realized, sells)
     open: list[OpenPosition] = field(default_factory=list)  # as of now, regardless of window
+    reconciled: list[Reconciliation] = field(default_factory=list)  # in the window
 
     @property
     def wins(self) -> list[ClosedTrade]:
@@ -104,6 +119,8 @@ class PnlReport:
         d["closed"] = [asdict(c) | {"return_pct": c.return_pct, "hold_s": c.hold_s} for c in self.closed]
         d["open"] = [asdict(p) | {"value_sol": p.value_sol, "unrealized_sol": p.unrealized_sol} for p in self.open]
         d["by_day"] = [{"day": day, "realized_sol": pnl, "sells": n} for day, pnl, n in self.by_day]
+        d["fees_note"] = ("buy-side fees only: live sell fees are taken out of proceeds"
+                          if self.mode == "live" else "all fills")
         d["summary"] = {
             "closed_trades": len(self.closed), "wins": len(self.wins), "losses": len(self.losses),
             "win_rate": len(self.wins) / len(self.closed) if self.closed else None,
@@ -125,6 +142,20 @@ def build_pnl(fills: list[dict], marks: dict[str, tuple[float, float]], *, mode:
 
     for row in sorted((r for r in fills if r["mode"] == mode), key=lambda r: (r["ts"], r.get("id", 0))):
         f = Fill(**{k: row[k] for k in _FILL_FIELDS})
+        if f.side == "reconcile":
+            n_rec = len(pf.reconciled)
+            pf.apply(f)
+            if len(pf.reconciled) > n_rec:
+                rec = pf.reconciled[-1]
+                if f.mint not in pf.holdings:  # nothing left: the position ends here, outside the trade stats
+                    spent.pop(f.mint, None)
+                    received.pop(f.mint, None)
+                elif rec["records_tokens"] > 0:  # keep cost and return figures consistent with the new size
+                    spent[f.mint] = spent.get(f.mint, 0.0) * rec["onchain_tokens"] / rec["records_tokens"]
+                if in_window(f.ts):
+                    rep.reconciled.append(Reconciliation(f.mint, f.ts, rec["records_tokens"], rec["onchain_tokens"],
+                                                         rec["cost_removed_sol"]))
+            continue
         if f.side == "buy":
             spent[f.mint] = spent.get(f.mint, 0.0) + f.sol_amount
         elif f.mint in pf.holdings:
@@ -133,7 +164,8 @@ def build_pnl(fills: list[dict], marks: dict[str, tuple[float, float]], *, mode:
         pnl = pf.apply(f)
         if in_window(f.ts):
             rep.n_fills += 1
-            rep.fees_sol += f.fee_sol
+            if f.side == "buy" or mode != "live":
+                rep.fees_sol += f.fee_sol
             if f.side == "buy":
                 rep.n_buys += 1
                 rep.deployed_sol += f.sol_amount
@@ -177,7 +209,7 @@ def _sol(x: float | None) -> str:
 def format_pnl(r: PnlReport, db_path: str, recent: int = 10) -> str:
     window = "all time" if r.since is None else f"since {_when(r.since)} UTC"
     out = [f"=== {r.mode.upper()} trading P&L - {window} - {db_path} ==="]
-    if not r.n_fills and not r.open:
+    if not r.n_fills and not r.open and not r.reconciled:
         out.append("  No fills in this period.")
         return "\n".join(out)
 
@@ -207,7 +239,11 @@ def format_pnl(r: PnlReport, db_path: str, recent: int = 10) -> str:
     else:
         rows.append(("Closed trades", "0"))
     rows.append(("Buys", f"{r.n_buys}, {r.deployed_sol:.4f} SOL spent"))
-    rows.append(("Fees paid", f"{r.fees_sol:.4f} SOL over {r.n_fills} fills"))
+    if r.mode == "live":
+        rows.append(("Fees paid", f"{r.fees_sol:.4f} SOL on {r.n_buys} buys "
+                                  "(sell fees come out of sale proceeds and are not itemised)"))
+    else:
+        rows.append(("Fees paid", f"{r.fees_sol:.4f} SOL over {r.n_fills} fills"))
     rows.append(("Open positions", str(len(r.open))))
     if r.open:
         unmarked = sum(1 for p in r.open if p.mark_price is None)
@@ -231,9 +267,16 @@ def format_pnl(r: PnlReport, db_path: str, recent: int = 10) -> str:
                     else "no price seen yet")
             out.append(f"  {short(p.mint)}  since {_when(p.entry_ts)}  cost {p.cost_sol:.4f} SOL  {mark}")
 
-    if r.closed:
+    if r.reconciled:
         out.append("")
-        shown = r.closed[-recent:][::-1]
+        out.append("  Wallet balance differed from the bot's records (proceeds unknown, not in the figures above)")
+        for c in r.reconciled:
+            out.append(f"  {short(c.mint)}  {_when(c.ts)}  records {c.records_tokens:.0f} tokens, wallet "
+                       f"{c.onchain_tokens:.0f}; cost {c.cost_removed_sol:.4f} SOL taken off the books")
+
+    shown = r.closed[-recent:][::-1] if recent > 0 else []
+    if shown:
+        out.append("")
         more = len(r.closed) - len(shown)
         out.append(f"  Recent closed trades (newest first{f', {more} older not shown' if more else ''})")
         for c in shown:

@@ -21,11 +21,15 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
+from .brokers.base import Fill
 from .brokers.paper import PaperBroker
 from .cases import iso
 from .config import Config, load_config
@@ -39,6 +43,14 @@ from .store import Store
 
 LIVE_ACK_ENV = "TRENCHNET_LIVE_ACK"
 LIVE_ACK_VALUE = "I understand this trades real funds"
+
+log = logging.getLogger("trenchnet")
+
+
+def _cmd(sub: str, cfg: Config) -> str:
+    """A command line the user can copy, keeping a non-default --db."""
+    extra = "" if cfg.db_path == Config().db_path else f" --db {shlex.quote(cfg.db_path)}"
+    return f"trenchnet {sub}{extra}"
 
 
 def _llm(cfg: Config, enabled: bool) -> LLM | None:
@@ -101,6 +113,7 @@ async def cmd_demo(args, cfg: Config) -> None:
 
     sc = article_scenario(seed=args.seed)
     store = Store(getattr(args, "db_path", None) or ":memory:")
+    store.clear_fills("backtest")
     store.add_trades(sc.history)
     llm = _llm(cfg, args.llm)
     print(f"Loaded {len(sc.history)} historical trades for {len(sc.aliases)} candidate wallets.\n")
@@ -110,8 +123,8 @@ async def cmd_demo(args, cfg: Config) -> None:
     tracked = tracked_from_roster(store.roster())
     print(f"\nTOKEN={short(sc.token)}  DECOY={short(sc.decoy)}  LONE={short(sc.lone)}\n")
     print("=== stages 2-4 + strategy: live replay ===")
-    engine = Engine(cfg, store, tracked, _judge(cfg, llm), Reporter(cfg, llm), PaperBroker(cfg.paper),
-                    history=sc.history)
+    engine = Engine(cfg, store, tracked, _judge(cfg, llm), Reporter(cfg, llm),
+                    PaperBroker(cfg.paper, mode="backtest"), history=sc.history)
     for ev in sc.live:
         await engine.handle(ev)
     await engine.tick(engine.now + 7 * 3600)
@@ -162,11 +175,18 @@ def _existing_store(cfg: Config) -> Store:
     """Open the database for a read-only command without creating an empty one
     in the wrong folder."""
     path = Path(cfg.db_path)
-    if cfg.db_path != ":memory:" and not path.exists():
-        sys.exit(f"no database at {path.resolve()}\n"
-                 "Run this from the folder where you ran `trenchnet run` / `trenchnet profile`, "
-                 "or point at the file with --db PATH.")
-    return Store(cfg.db_path)
+    if cfg.db_path != ":memory:":
+        if not path.exists():
+            sys.exit(f"no database at {path.resolve()}\n"
+                     "Run this from the folder where you ran `trenchnet run` / `trenchnet profile`, "
+                     "or point at the file with --db PATH.")
+        if path.is_dir():
+            sys.exit(f"{path.resolve()} is a folder; pass the database file inside it, "
+                     f"e.g. --db {shlex.quote(str(path / 'trenchnet.db'))}")
+    try:
+        return Store(cfg.db_path)
+    except sqlite3.DatabaseError as e:
+        sys.exit(f"cannot open {path.resolve()} as a trenchnet database: {e}")
 
 
 def _load_tracked(store: Store) -> dict:
@@ -185,11 +205,17 @@ async def cmd_replay(args, cfg: Config) -> None:
     start = events[0].ts if events else time.time()
     history = store.trades(wallets=list(tracked), until=start - 1e-6)
     llm = _llm(cfg, not args.no_llm)
-    engine = Engine(cfg, store, tracked, _judge(cfg, llm), Reporter(cfg, llm), PaperBroker(cfg.paper),
-                    history=history)
+    # Backtest fills are labelled separately and replaced on each replay, so they
+    # never mix with paper/live results or pile up across re-runs.
+    cleared = store.clear_fills("backtest")
+    if cleared:
+        print(f"(replacing the previous backtest's {cleared} fills)")
+    engine = Engine(cfg, store, tracked, _judge(cfg, llm), Reporter(cfg, llm),
+                    PaperBroker(cfg.paper, mode="backtest"), history=history)
     for ev in events:
         await engine.handle(ev)
     _print_summary(engine)
+    print(f"Backtest results again later: {_cmd('pnl --mode backtest', cfg)}")
 
 
 async def cmd_run(args, cfg: Config) -> None:
@@ -243,30 +269,32 @@ async def cmd_run(args, cfg: Config) -> None:
         engine.portfolio.cash_sol = cfg.paper.starting_balance_sol  # on-chain balance, not replayed fills
         for mint, h in list(engine.portfolio.holdings.items()):
             onchain = await rpc.get_token_balance(owner, mint)
+            if abs(onchain - h.tokens) <= 1e-6 * max(onchain, h.tokens):
+                continue
             if onchain <= 0:
-                print(f"warning: stored holding {short(mint)} has no on-chain balance; dropping it")
-                del engine.portfolio.holdings[mint]
-            elif abs(onchain - h.tokens) > 1e-6 * max(onchain, h.tokens):
+                print(f"warning: stored holding {short(mint)} has no on-chain balance; closing it in the records")
+            else:
                 print(f"note: {short(mint)} on-chain balance {onchain:.0f} differs from records {h.tokens:.0f}; "
                       "using on-chain")
-                h.cost_sol *= onchain / h.tokens
-                h.tokens = onchain
+            # Saved as a fill so restarts and `trenchnet pnl` see the same holdings as this run.
+            adj = Fill(mint, "reconcile", 0.0, max(onchain, 0.0), 0.0, 0.0, time.time(), broker.mode,
+                       f"reconcile: wallet {onchain:.0f} vs records {h.tokens:.0f}")
+            engine.portfolio.apply(adj)
+            store.add_fill(**adj.to_dict())
     for mint in engine.portfolio.holdings:
         await source.watch_tokens([mint])
     if engine.portfolio.holdings:
         print(f"resumed {len(engine.portfolio.holdings)} open position(s)")
 
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, source.stop)
-        except NotImplementedError:
-            pass
+    restore_signals = _install_stop_handlers(asyncio.get_running_loop(), source.stop)
 
     async def ticker() -> None:
         while True:
             await asyncio.sleep(30)
-            await engine.tick(time.time())
+            try:
+                await engine.tick(time.time())
+            except Exception:  # noqa: BLE001 - one bad tick must not end time-based exits for the session
+                log.exception("tick failed; retrying in 30s")
 
     tick_task = asyncio.create_task(ticker())
     try:
@@ -279,7 +307,55 @@ async def cmd_run(args, cfg: Config) -> None:
         if rpc is not None:
             await rpc.aclose()
         _print_summary(engine)
-        print("Full history: trenchnet pnl")
+        print(f"Full history: {_cmd('pnl', cfg)}")
+        restore_signals()
+
+
+def _install_stop_handlers(loop: asyncio.AbstractEventLoop, stop: Callable[[], None]) -> Callable[[], None]:
+    """First Ctrl-C: stop after the current event (an order being confirmed
+    finishes and is recorded). Second Ctrl-C: quit immediately.
+
+    POSIX uses loop.add_signal_handler. Windows' event loop doesn't support
+    it, so a plain signal handler hands the stop to the loop instead of
+    letting the default handler cancel whatever is running, which could be a
+    live order awaiting confirmation. Returns a function that restores the
+    previous handlers."""
+    presses = 0
+    previous: dict[int, object] = {}
+    posix: list[int] = []
+
+    def on_signal(signum: int | None = None, frame: object = None) -> None:
+        nonlocal presses
+        presses += 1
+        if presses == 1:
+            print("stopping after the current event... (press Ctrl-C again to quit immediately)",
+                  file=sys.stderr, flush=True)
+            loop.call_soon_threadsafe(stop)
+            return
+        prev = previous.get(signum) if signum is not None else None
+        if callable(prev):
+            prev(signum, frame)  # asyncio's own handler: cancels the run, ending in KeyboardInterrupt
+        else:
+            raise KeyboardInterrupt
+
+    sigs = [signal.SIGINT, signal.SIGTERM] + ([signal.SIGBREAK] if hasattr(signal, "SIGBREAK") else [])
+    for sig in sigs:
+        try:
+            loop.add_signal_handler(sig, on_signal)
+            posix.append(sig)
+        except (NotImplementedError, RuntimeError):
+            try:
+                previous[sig] = signal.signal(sig, on_signal)
+            except (OSError, ValueError):
+                pass
+
+    def restore() -> None:
+        for sig in posix:
+            loop.remove_signal_handler(sig)
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+
+    return restore
 
 
 def _age(seconds: float) -> str:
@@ -311,7 +387,10 @@ async def cmd_pnl(args, cfg: Config) -> None:
     fills = store.fills()
     modes = [args.mode] if args.mode else [m for m in ("paper", "live") if any(f["mode"] == m for f in fills)]
     if not modes:
-        sys.exit(f"no trades recorded in {cfg.db_path} yet. Paper trade first: trenchnet run")
+        hint = (f"\n(There are backtest results: {_cmd('pnl --mode backtest', cfg)})"
+                if any(f["mode"] == "backtest" for f in fills) else "")
+        sys.exit(f"no paper or live trades recorded in {cfg.db_path} yet. "
+                 f"Paper trade first: {_cmd('run', cfg)}{hint}")
     reports = []
     for mode in modes:
         held = {f["mint"] for f in fills if f["mode"] == mode}
@@ -323,12 +402,21 @@ async def cmd_pnl(args, cfg: Config) -> None:
     print("\n\n".join(format_pnl(r, cfg.db_path, recent=args.recent) for r in reports))
 
 
+def _nonneg_int(text: str) -> int:
+    v = int(text)
+    if v < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return v
+
+
 def _utf8_output() -> None:
     """Windows writes redirected output as cp1252, which can't encode the
-    symbols in reports; use UTF-8 and never crash on an odd character."""
+    symbols in reports; use UTF-8 and never crash on an odd character.
+    Line buffering keeps `trenchnet run` output live when piped (tee, older
+    Git Bash windows)."""
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
         except (AttributeError, ValueError, OSError):
             pass
 
@@ -392,8 +480,9 @@ def main(argv: list[str] | None = None) -> None:
 
     s = command("pnl", help="profit and loss from the bot's paper/live trades")
     s.add_argument("--since", help="only this period: 24h, 7d, 2w, or a UTC date like 2026-10-01")
-    s.add_argument("--mode", choices=("paper", "live"), help="default: every mode that has trades")
-    s.add_argument("--recent", type=int, default=10, help="how many closed trades to list")
+    s.add_argument("--mode", choices=("paper", "live", "backtest"),
+                   help="default: paper and live (whichever have trades); backtest = the last replay/demo")
+    s.add_argument("--recent", type=_nonneg_int, default=10, help="how many closed trades to list (0 = none)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_pnl)
 
@@ -406,7 +495,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         asyncio.run(args.fn(args, cfg))
     except KeyboardInterrupt:
-        # Ctrl-C on Windows arrives here after `run` has printed its summary.
+        # A forced quit (second Ctrl-C), or Ctrl-C outside `run`'s main loop.
         print("stopped", file=sys.stderr)
         sys.exit(130)
 

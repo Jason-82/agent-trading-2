@@ -36,11 +36,15 @@ class Portfolio:
         self.daily_realized: dict[str, float] = {}
         self.traded_mints: set[str] = set()
         self.fills: list[Fill] = []
+        self.reconciled: list[dict] = []
 
     def apply(self, f: Fill, tp_index: int | None = None) -> float:
-        """Apply a fill; returns realized PnL of this fill (0 for buys)."""
+        """Apply a fill; returns realized PnL of this fill (0 for buys and reconciliations)."""
         self.fills.append(f)
         self.traded_mints.add(f.mint)
+        if f.side == "reconcile":
+            self._reconcile(f)
+            return 0.0
         if f.side == "buy":
             self.cash_sol -= f.sol_amount
             h = self.holdings.get(f.mint)
@@ -76,6 +80,26 @@ class Portfolio:
             })
             del self.holdings[f.mint]
         return pnl
+
+    def _reconcile(self, f: Fill) -> None:
+        """Set a holding to the balance found on-chain. The proceeds of tokens
+        that left outside the bot's records are unknown, so no P&L is booked:
+        the cost basis is scaled with the tokens (or written off if none are left)."""
+        h = self.holdings.get(f.mint)
+        if h is None:
+            return
+        old, new = h.tokens, max(0.0, f.token_amount)
+        removed_cost = h.cost_sol * (1 - new / old) if old > 0 else h.cost_sol
+        self.reconciled.append({"mint": f.mint, "ts": f.ts, "records_tokens": old, "onchain_tokens": new,
+                                "cost_removed_sol": removed_cost, "reason": f.reason})
+        if new <= 0:
+            del self.holdings[f.mint]
+            return
+        if old > 0:
+            h.cost_sol *= new / old
+        h.tokens = new
+        h.original_tokens = max(h.original_tokens * new / old if old > 0 else new, new)
+        h.entry_price = h.cost_sol / new if h.cost_sol > 0 else h.entry_price
 
     def exposure_sol(self) -> float:
         return sum(h.cost_sol for h in self.holdings.values())

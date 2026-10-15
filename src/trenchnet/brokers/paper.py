@@ -9,10 +9,12 @@ from .base import Fill
 
 
 class PaperBroker:
-    mode = "paper"
+    """`mode` labels the stored fills: "paper" for `trenchnet run`, "backtest"
+    for replay and the demo, so `trenchnet pnl` never mixes them."""
 
-    def __init__(self, cfg: PaperConfig) -> None:
+    def __init__(self, cfg: PaperConfig, mode: str = "paper") -> None:
         self.cfg = cfg
+        self.mode = mode
 
     def _impact(self) -> float:
         return (self.cfg.slippage_bps + self.cfg.latency_penalty_bps) / 1e4
