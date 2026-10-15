@@ -81,11 +81,14 @@ stop, and records the "A buys then sells immediately" case without analysis.
    export SOLANA_RPC_URL=https://...
    trenchnet backfill wallets.txt --limit 1000
    ```
-   It reads about 8 transactions a second (`--rps` changes that; Helius'
-   free plan allows 10), shows one progress line per wallet, and skips any
+   It reads about 5 transactions a second (`--rps` changes that), shows one
+   progress line per wallet with why any transactions were skipped, and skips any
    line in `wallets.txt` that isn't a wallet address. If it stops early
    (credits used up, provider down) the trades read so far are kept; run the
-   same command again later and already-saved trades are skipped.
+   same command again later and already-saved trades are skipped. Add
+   `--new-only` to download only wallets you haven't downloaded before.
+   `trenchnet inspect <wallet or nickname>` shows, transaction by transaction,
+   what the reader made of a wallet's recent activity.
    Or import your own data: `trenchnet import trades.jsonl` (format in
    `sources/replay.py`).
 3. **Profile and select:** `trenchnet profile --wallets wallets.txt`, then

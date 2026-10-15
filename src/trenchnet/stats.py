@@ -184,7 +184,8 @@ def select(stats: WalletStats, c: SelectionCriteria) -> Selection:
     ok = True
     if stats.closed_positions < c.min_closed_positions:
         ok = False
-        reasons.append(f"only {stats.closed_positions} closed positions (< {c.min_closed_positions})")
+        reasons.append(f"only {stats.closed_positions} closed positions (< {c.min_closed_positions}): "
+                       f"{stats.n_buys} buys, {stats.n_sells} sells, {stats.n_transfers} transfers")
     if stats.realized_pnl_sol < c.min_realized_pnl_sol:
         ok = False
         reasons.append(f"realized PnL {stats.realized_pnl_sol:.2f} SOL (< {c.min_realized_pnl_sol})")

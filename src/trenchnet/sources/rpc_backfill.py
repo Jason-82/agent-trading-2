@@ -85,13 +85,33 @@ def _owned_accounts(balances: list[dict] | None, owner: str) -> set[int]:
     return {b["accountIndex"] for b in balances or [] if b.get("owner") == owner and "accountIndex" in b}
 
 
-def parse_wallet_tx(tx: dict | None, wallet: str, signature: str) -> list[Trade]:
+# Why a transaction produced no trade, in plain words (used in summaries and `trenchnet inspect`).
+SKIP_REASONS = {
+    "failed": "transaction failed",
+    "not_in_tx": "wallet not in the transaction",
+    "no_token_change": "no token balance change (SOL transfers, fees, other activity)",
+    "several_tokens": "several tokens changed at once (multi-token swap or batch)",
+    "no_time": "no block time",
+}
+
+
+@dataclass
+class TxView:
+    """What one transaction did to one wallet, as the parser sees it."""
+
+    status: str  # "trade" or a key of SKIP_REASONS
+    sol_delta: float = 0.0  # SOL the wallet gained (+) or spent (-), excluding fee and token-account rent
+    token_deltas: dict[str, float] = field(default_factory=dict)  # mint -> change, wallet-owned accounts, excl. WSOL
+    trade: Trade | None = None
+
+
+def analyze_wallet_tx(tx: dict | None, wallet: str, signature: str) -> TxView:
     if not tx or not tx.get("meta") or tx["meta"].get("err") is not None:
-        return []
+        return TxView("failed")
     meta = tx["meta"]
     keys = account_keys(tx)
     if wallet not in keys:
-        return []
+        return TxView("not_in_tx")
     i = keys.index(wallet)
     sol_delta = (meta["postBalances"][i] - meta["preBalances"][i]) / LAMPORTS_PER_SOL
     if i == 0:
@@ -112,8 +132,10 @@ def parse_wallet_tx(tx: dict | None, wallet: str, signature: str) -> list[Trade]
 
     deltas = {m: post.get(m, 0.0) - pre.get(m, 0.0) for m in set(pre) | set(post)}
     deltas = {m: d for m, d in deltas.items() if abs(d) > 0}
-    if len(deltas) != 1:
-        return []
+    if not deltas:
+        return TxView("no_token_change", sol_delta)
+    if len(deltas) > 1:
+        return TxView("several_tokens", sol_delta, deltas)
     mint, d = next(iter(deltas.items()))
 
     if d > 0 and sol_delta < -MIN_SOL_MOVE:
@@ -126,9 +148,15 @@ def parse_wallet_tx(tx: dict | None, wallet: str, signature: str) -> list[Trade]
         side, sol = Side.TRANSFER_OUT, 0.0
     ts = tx.get("blockTime")
     if ts is None:
-        return []
-    return [Trade(signature=signature, wallet=wallet, mint=mint, side=side, sol_amount=sol,
-                  token_amount=abs(d), ts=float(ts), source="rpc")]
+        return TxView("no_time", sol_delta, deltas)
+    trade = Trade(signature=signature, wallet=wallet, mint=mint, side=side, sol_amount=sol,
+                  token_amount=abs(d), ts=float(ts), source="rpc")
+    return TxView("trade", sol_delta, deltas, trade)
+
+
+def parse_wallet_tx(tx: dict | None, wallet: str, signature: str) -> list[Trade]:
+    view = analyze_wallet_tx(tx, wallet, signature)
+    return [view.trade] if view.trade is not None else []
 
 
 BREAKER = 10  # this many transactions in a row failing at the HTTP level: stop instead of grinding for hours
@@ -140,6 +168,7 @@ class BackfillResult:
     transactions: int = 0  # successful transactions examined
     unreadable: Counter = field(default_factory=Counter)  # reason -> count, after retries
     not_attempted: int = 0  # signatures left unread because the backfill stopped early
+    ignored: Counter = field(default_factory=Counter)  # read fine but no trade: SKIP_REASONS key -> count
     stopped: RpcHTTPError | None = None  # why it stopped early (fatal error or circuit breaker)
 
 
@@ -207,12 +236,15 @@ async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500
             try:
                 tx = await fetch_transaction(rpc, sig)
                 try:
-                    found = parse_wallet_tx(tx, wallet, sig)
+                    view = analyze_wallet_tx(tx, wallet, sig)
                 except (KeyError, TypeError, IndexError, ValueError):
                     # Unfamiliar readable layout (a new transaction format?): decode the raw form instead.
-                    found = parse_wallet_tx(await rpc.get_transaction(sig, encoding="base64"), wallet, sig)
+                    view = analyze_wallet_tx(await rpc.get_transaction(sig, encoding="base64"), wallet, sig)
                 res.transactions += 1
-                res.trades += found
+                if view.trade is not None:
+                    res.trades.append(view.trade)
+                else:
+                    res.ignored[view.status] += 1
             except RpcHTTPError as e:
                 if e.fatal:
                     res.stopped = e

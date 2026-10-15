@@ -132,6 +132,9 @@ class Store:
         q += " ORDER BY ts, rowid"
         return [self._row_to_trade(r) for r in self.db.execute(q, args)]
 
+    def wallet_trade_counts(self) -> dict[str, int]:
+        return {r[0]: r[1] for r in self.db.execute("SELECT wallet, COUNT(*) FROM trades GROUP BY wallet")}
+
     def wallets(self) -> list[str]:
         return [r[0] for r in self.db.execute("SELECT DISTINCT wallet FROM trades ORDER BY wallet")]
 

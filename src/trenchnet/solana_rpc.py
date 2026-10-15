@@ -1,7 +1,8 @@
 """Minimal async Solana JSON-RPC client (standard methods only).
 
-Requests are paced to stay under the provider's rate limit (Helius' free
-plan allows 10 requests/second), and 429 / 5xx answers are retried with
+Requests are paced to stay under the provider's rate limit (5 per second by
+default: Helius' free plan advertises 10 but answers 429 well before that on
+history calls), and 429 / 5xx answers are retried with
 backoff, honouring Retry-After when the provider sends it.
 """
 
@@ -74,7 +75,7 @@ class SolanaRpc:
         self.max_retries = max_retries
         self.backoff_s = backoff_s
         if requests_per_second is None:
-            requests_per_second = 3.0 if self.is_public else 8.0
+            requests_per_second = 3.0 if self.is_public else 5.0
         self.requests_per_second = requests_per_second
         self._interval = 1.0 / requests_per_second if requests_per_second > 0 else 0.0
         self._next_slot = 0.0

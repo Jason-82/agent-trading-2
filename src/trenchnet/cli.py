@@ -3,6 +3,7 @@
     trenchnet demo                     # offline walkthrough of the article's scenario
     trenchnet import trades.jsonl      # load historical trades
     trenchnet backfill wallets.txt     # pull wallet history from a Solana RPC
+    trenchnet inspect <wallet>         # how a wallet's recent transactions are read
     trenchnet profile                  # stats + profiles + roster selection
     trenchnet roster                   # show the roster
     trenchnet replay events.jsonl      # backtest the pipeline on recorded events
@@ -28,6 +29,7 @@ import signal
 import sqlite3
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Callable
 
@@ -201,6 +203,22 @@ async def cmd_import(args, cfg: Config) -> None:
     print(f"imported {n} new trades into {cfg.db_path}")
 
 
+def _wallet_summary(res) -> str:
+    from .models import Side
+    from .sources.rpc_backfill import SKIP_REASONS
+
+    sides = Counter(t.side for t in res.trades)
+    parts = [f"{sides[Side.BUY]} buys", f"{sides[Side.SELL]} sells"]
+    transfers = sides[Side.TRANSFER_IN] + sides[Side.TRANSFER_OUT]
+    if transfers:
+        parts.append(f"{transfers} transfers")
+    text = f"{', '.join(parts)} from {res.transactions} transactions"
+    if res.ignored and (not res.trades or sum(res.ignored.values()) > len(res.trades)):
+        why = "; ".join(f"{c} {SKIP_REASONS.get(r, r).split(' (')[0]}" for r, c in res.ignored.most_common(2))
+        text += f" [skipped: {why}]"
+    return text
+
+
 _STOP_ADVICE = {
     "credentials": "The RPC rejected the URL or API key. Check SOLANA_RPC_URL (the full Helius URL including "
                    "?api-key=...) and run `source .env`.",
@@ -232,6 +250,15 @@ async def cmd_backfill(args, cfg: Config) -> None:
         print("  This is Solana's free public RPC: slow and heavily rate limited. To use your Helius key,\n"
               "  run `source .env` first (or set SOLANA_RPC_URL).", file=sys.stderr)
     store = Store(cfg.db_path)
+    if args.new_only:
+        have = store.wallet_trade_counts()
+        before = len(wallets)
+        wallets = [w for w in wallets if not have.get(w)]
+        print(f"--new-only: {before - len(wallets)} wallet(s) already downloaded, {len(wallets)} to go.")
+        if not wallets:
+            await rpc.aclose()
+            print(f"Nothing to do. Next: {_cmd('profile --wallets ' + shlex.quote(args.wallets), cfg)}")
+            return
     total_new = 0
     done_wallets = 0
     skipped: list[str] = []
@@ -269,7 +296,7 @@ async def cmd_backfill(args, cfg: Config) -> None:
             done_wallets += 1
             n = store.add_trades(res.trades)
             total_new += n
-            line = f"{label}: {len(res.trades)} trades from {res.transactions} transactions ({n} new)"
+            line = f"{label}: {_wallet_summary(res)} ({n} new)"
             if res.unreadable:
                 why = ", ".join(f"{c} {r}" for r, c in res.unreadable.most_common())
                 line += f"; {sum(res.unreadable.values())} unreadable ({why})"
@@ -291,6 +318,107 @@ async def cmd_backfill(args, cfg: Config) -> None:
         print(f"(the RPC asked us to slow down {rpc.rate_limited} times; if that number is large, "
               f"try --rps {rpc.requests_per_second / 2:g})")
     print(f"Next: {_cmd('profile --wallets ' + shlex.quote(args.wallets), cfg)}")
+
+
+def _resolve_wallet(text: str, cfg: Config) -> str:
+    """A full address, a nickname (from the roster or wallets.txt), or the
+    short form printed by other commands, e.g. 4vw5…9Ud9."""
+    from solders.pubkey import Pubkey
+
+    text = text.strip()
+    try:
+        Pubkey.from_string(text)
+        return text
+    except ValueError:
+        pass
+    known: dict[str, str] = {}  # wallet -> nickname
+    if Path("wallets.txt").exists():
+        try:
+            ws, al = _read_wallets("wallets.txt")
+            known.update({w: al.get(w, "") for w in ws})
+        except SystemExit:
+            pass
+    if cfg.db_path == ":memory:" or Path(cfg.db_path).exists():
+        for r in Store(cfg.db_path).roster(included_only=False):
+            known[r["wallet"]] = r["alias"] or known.get(r["wallet"], "")
+    by_alias = [w for w, a in known.items() if a and a.lower() == text.lower()]
+    m = re.fullmatch(r"(\w+)(?:…|\.\.\.)(\w+)", text)
+    by_short = [w for w in known if m and w.startswith(m.group(1)) and w.endswith(m.group(2))]
+    found = by_alias or by_short
+    if len(found) == 1:
+        return found[0]
+    if len(found) > 1:
+        sys.exit(f"{text!r} matches several wallets; use the full address")
+    sys.exit(f"{text!r} is not a wallet address, and no wallet in wallets.txt or the roster has that nickname")
+
+
+_SHORT_SKIP = {
+    "failed": "failed on-chain",
+    "not_in_tx": "wallet not in tx",
+    "no_token_change": "no token change",
+    "several_tokens": "2+ tokens changed",
+    "no_time": "no block time",
+    "unreadable": "could not read",
+}
+
+
+async def cmd_inspect(args, cfg: Config) -> None:
+    from .solana_rpc import RpcError, RpcHTTPError
+    from .sources.rpc_backfill import analyze_wallet_tx, fetch_transaction
+
+    wallet = _resolve_wallet(args.wallet, cfg)
+    rpc = _rpc_from(args.rpc or os.environ.get("SOLANA_RPC_URL") or cfg.live.rpc_url)
+    counts: Counter = Counter()
+    examples: dict[str, list[str]] = {}
+    try:
+        try:
+            sigs = await rpc.get_signatures(wallet, limit=args.limit)
+        except (RpcHTTPError, RpcError) as e:
+            sys.exit(f"Could not list the wallet's transactions: {e}")
+        print(f"Wallet {wallet}: its last {len(sigs)} transactions, newest first (read from {rpc.host})\n")
+        print(f"{'time (UTC)':<17}  {'read as':<27} {'SOL change':>11}  token changes (wallet-owned)")
+        for s in sigs:
+            sig = s["signature"]
+            when = iso(s.get("blockTime")) or "?"
+            if s.get("err") is not None:
+                kind, sol, tokens = "failed", "", ""
+            else:
+                try:
+                    view = analyze_wallet_tx(await fetch_transaction(rpc, sig), wallet, sig)
+                except (RpcHTTPError, RpcError) as e:
+                    kind, sol, tokens = "unreadable", "", str(e)[:60]
+                else:
+                    kind = view.trade.side.value.upper().replace("_", " ") if view.trade is not None else view.status
+                    sol = f"{view.sol_delta:+.4f}"
+                    tokens = ", ".join(f"{short(m)} {d:+,.6g}" for m, d in list(view.token_deltas.items())[:3])
+                    if len(view.token_deltas) > 3:
+                        tokens += f", +{len(view.token_deltas) - 3} more"
+            counts[kind] += 1
+            examples.setdefault(kind, [])
+            if len(examples[kind]) < 2:
+                examples[kind].append(sig)
+            label = kind if kind not in _SHORT_SKIP else "skipped: " + _SHORT_SKIP[kind]
+            print(f"{when[:16]:<17}  {label:<27} {sol:>11}  {tokens}")
+    finally:
+        await rpc.aclose()
+
+    print("\nSummary: " + ", ".join(f"{c} {_SHORT_SKIP.get(k, k.lower())}" for k, c in counts.most_common()))
+    traded = sum(c for k, c in counts.items() if k in ("BUY", "SELL"))
+    if counts and not traded:
+        print("No buys or sells found. If this wallet does trade, open an example below on Solscan "
+              "and compare it with what the reader saw.")
+    elif counts.get("BUY") and not counts.get("SELL"):
+        print("Buys but no sells in this window: the wallet may sell from a different wallet (look for "
+              "TRANSFER OUT), or simply hold.")
+    for kind, sigs_ in examples.items():
+        if kind in ("BUY", "SELL"):
+            continue
+        for sig in sigs_:
+            print(f"  {_SHORT_SKIP.get(kind, kind.lower())}: https://solscan.io/tx/{sig}")
+    if cfg.db_path == ":memory:" or Path(cfg.db_path).exists():
+        stored = Counter(t.side.value for t in Store(cfg.db_path).trades(wallets=[wallet]))
+        if stored:
+            print("Saved in the database for this wallet: " + ", ".join(f"{c} {k}" for k, c in stored.most_common()))
 
 
 async def cmd_profile(args, cfg: Config) -> None:
@@ -598,8 +726,15 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--limit", type=int, default=500, help="max signatures per wallet")
     s.add_argument("--rpc", help="RPC URL (default: $SOLANA_RPC_URL or [live].rpc_url)")
     s.add_argument("--rps", type=_positive_rate, default=None,
-                   help="max requests per second (default 8, or 3 on Solana's public RPC; Helius free allows 10)")
+                   help="max requests per second (default 5, or 3 on Solana's public RPC)")
+    s.add_argument("--new-only", action="store_true", help="skip wallets that already have trades saved")
     s.set_defaults(fn=cmd_backfill)
+
+    s = command("inspect", help="show how a wallet's recent transactions are read (buy/sell/skipped and why)")
+    s.add_argument("wallet", help="full address, nickname, or the short form like 4vw5…9Ud9")
+    s.add_argument("--limit", type=int, default=30, help="how many recent transactions (default 30)")
+    s.add_argument("--rpc", help="RPC URL (default: $SOLANA_RPC_URL)")
+    s.set_defaults(fn=cmd_inspect)
 
     s = command("profile", help="compute stats, profile wallets and select the roster")
     s.add_argument("--wallets", help="limit to wallets in this file (address[,alias] per line)")

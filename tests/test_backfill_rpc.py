@@ -98,7 +98,7 @@ async def test_transaction_version_is_negotiated():
 
 def test_public_rpc_gets_a_gentler_pace():
     assert SolanaRpc("https://api.mainnet-beta.solana.com").requests_per_second == 3
-    assert SolanaRpc("https://mainnet.helius-rpc.com/?api-key=x").requests_per_second == 8
+    assert SolanaRpc("https://mainnet.helius-rpc.com/?api-key=x").requests_per_second == 5
 
 
 # -- reading transactions of every format --------------------------------------------
