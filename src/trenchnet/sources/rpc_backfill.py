@@ -17,8 +17,9 @@ tokens at once are skipped rather than guessed. Tips paid alongside a real
 trade remain inside its SOL amount.
 
 Transactions of every version (legacy, v0, and v1 from Sept 2026) are read.
-Large v1 transactions can only be returned in raw base64 form; those are
-decoded locally with solders.
+If a node can't return a transaction in readable form, or returns a layout
+this parser doesn't know, the raw base64 form is fetched and decoded locally
+with solders.
 
 This makes one getTransaction call per signature, paced to the RPC's rate
 limit; a free Helius key handles a 1,000-transaction wallet in a few minutes.
@@ -130,11 +131,16 @@ def parse_wallet_tx(tx: dict | None, wallet: str, signature: str) -> list[Trade]
                   token_amount=abs(d), ts=float(ts), source="rpc")]
 
 
+BREAKER = 10  # this many transactions in a row failing at the HTTP level: stop instead of grinding for hours
+
+
 @dataclass
 class BackfillResult:
-    trades: list[Trade] = field(default_factory=list)
+    trades: list[Trade] = field(default_factory=list)  # kept even when the wallet stops early
     transactions: int = 0  # successful transactions examined
     unreadable: Counter = field(default_factory=Counter)  # reason -> count, after retries
+    not_attempted: int = 0  # signatures left unread because the backfill stopped early
+    stopped: RpcHTTPError | None = None  # why it stopped early (fatal error or circuit breaker)
 
 
 async def fetch_transaction(rpc: SolanaRpc, signature: str) -> dict | None:
@@ -156,17 +162,35 @@ def _reason(e: Exception) -> str:
     return type(e).__name__
 
 
+async def _list_signatures(rpc: SolanaRpc, wallet: str, limit: int, before: str | None,
+                           retry_pause_s: float) -> list[dict]:
+    try:
+        return await rpc.get_signatures(wallet, limit=limit, before=before)
+    except RpcHTTPError as e:
+        if e.fatal:
+            raise
+        await asyncio.sleep(retry_pause_s)  # one more try after a pause, like transactions get
+        return await rpc.get_signatures(wallet, limit=limit, before=before)
+
+
 async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500,
                           progress: Callable[[int, int, int], None] | None = None,
-                          retry_pause_s: float = 10.0) -> BackfillResult:
+                          retry_pause_s: float = 10.0, result: BackfillResult | None = None) -> BackfillResult:
     """Read up to `max_signatures` of the wallet's most recent successful
-    transactions. Transactions that fail temporarily (rate limits, network)
-    are retried once at the end. A rejected URL or API key raises
-    RpcHTTPError immediately."""
+    transactions.
+
+    Transactions that fail temporarily (rate limits, network) are retried
+    once at the end. The backfill stops early, keeping what it has read, on
+    a fatal error (rejected key/URL, credits used up) or after BREAKER
+    transactions in a row fail at the HTTP level; `result.stopped` says why.
+    Pass `result` to keep partial trades if the caller is cancelled.
+    Failing to list the wallet's transactions at all raises RpcHTTPError or
+    RpcError."""
+    res = result if result is not None else BackfillResult()
     sigs: list[str] = []
     before = None
     while len(sigs) < max_signatures:
-        page = await rpc.get_signatures(wallet, limit=min(1000, max_signatures - len(sigs)), before=before)
+        page = await _list_signatures(rpc, wallet, min(1000, max_signatures - len(sigs)), before, retry_pause_s)
         if not page:
             break
         sigs += [s["signature"] for s in page if s.get("err") is None]
@@ -174,12 +198,11 @@ async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500
         if len(page) < 1000:
             break
     sigs = sigs[:max_signatures]
-
-    res = BackfillResult()
     warned: set[str] = set()
 
     async def read(batch: list[str], show_progress: bool) -> dict[str, Exception]:
         failed: dict[str, Exception] = {}
+        streak = 0
         for n, sig in enumerate(batch, 1):
             try:
                 tx = await fetch_transaction(rpc, sig)
@@ -192,10 +215,19 @@ async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500
                 res.trades += found
             except RpcHTTPError as e:
                 if e.fatal:
-                    raise
+                    res.stopped = e
+                    res.not_attempted += len(batch) - n + 1
+                    return failed
                 failed[sig] = e
+                streak += 1
+                if streak >= BREAKER:
+                    res.stopped = RpcHTTPError(e.status, f"{BREAKER} transactions in a row failed ({e})")
+                    res.not_attempted += len(batch) - n
+                    return failed
             except Exception as e:  # noqa: BLE001 - one bad transaction should not stop a backfill
                 failed[sig] = e
+            else:
+                streak = 0
             if sig in failed:
                 reason = _reason(failed[sig])
                 if reason not in warned:  # one line per kind of problem, not one per transaction
@@ -207,7 +239,7 @@ async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500
 
     failed = await read(sigs, show_progress=True)
     transient = [s for s, e in failed.items() if isinstance(e, RpcHTTPError)]
-    if transient:
+    if transient and res.stopped is None:
         log.info("retrying %d transactions after a pause", len(transient))
         await asyncio.sleep(retry_pause_s)
         for s in transient:

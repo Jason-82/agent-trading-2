@@ -20,7 +20,9 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
+import re
 import shlex
 import signal
 import sqlite3
@@ -69,17 +71,77 @@ def _judge(cfg: Config, llm: LLM | None):
     return ClaudeJudge(cfg, llm) if (llm is not None and cfg.llm.use_llm_judge) else HeuristicJudge(cfg)
 
 
+def _read_text_any(path: str) -> str:
+    """Text saved by Notepad, Excel or PowerShell: UTF-8 (with or without a
+    BOM), UTF-16, or the Windows ANSI code page."""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as e:
+        sys.exit(f"can't read {path}: {e.strerror}")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
 def _read_wallets(path: str) -> tuple[list[str], dict[str, str]]:
-    wallets, aliases = [], {}
-    for line in Path(path).read_text().splitlines():
-        line = line.split("#", 1)[0].strip()
+    """`address[,alias]` per line (a space or tab also separates the alias).
+    Lines that aren't Solana addresses are reported with their line number
+    and skipped, so a typo can't derail a long backfill."""
+    from solders.pubkey import Pubkey
+
+    wallets, aliases, bad = [], {}, []
+    for n, line in enumerate(_read_text_any(path).splitlines(), 1):
+        line = line.split("#", 1)[0].strip().lstrip("\ufeff").strip()
         if not line:
             continue
-        parts = [p.strip() for p in line.split(",")]
-        wallets.append(parts[0])
-        if len(parts) > 1 and parts[1]:
-            aliases[parts[0]] = parts[1]
+        parts = re.split(r"[,\s]+", line, maxsplit=1)
+        addr = parts[0]
+        try:
+            Pubkey.from_string(addr)
+        except ValueError:
+            bad.append(f"  line {n}: {addr!r}")
+            continue
+        if addr not in aliases and addr not in wallets:
+            wallets.append(addr)
+        if len(parts) > 1 and parts[1].strip(" ,"):
+            aliases[addr] = parts[1].strip(" ,")
+    if bad:
+        print(f"Skipping {len(bad)} line(s) in {path} that aren't Solana wallet addresses:\n" + "\n".join(bad),
+              file=sys.stderr)
+    if not wallets:
+        sys.exit(f"{path} has no valid wallet addresses in it")
     return wallets, aliases
+
+
+class _Progress:
+    """A single updating status line (\\r). Ended with a newline before any
+    log message or other output so the two never run together."""
+
+    def __init__(self) -> None:
+        self.open = False
+
+    def show(self, text: str) -> None:
+        sys.stdout.write("\r" + text + " " * 8)
+        sys.stdout.flush()
+        self.open = True
+
+    def end(self) -> None:
+        if self.open:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self.open = False
+
+
+PROGRESS = _Progress()
+
+
+class _EndProgressLine(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        PROGRESS.end()
+        return True
 
 
 def _print_roster(rows: list[dict]) -> None:
@@ -139,45 +201,96 @@ async def cmd_import(args, cfg: Config) -> None:
     print(f"imported {n} new trades into {cfg.db_path}")
 
 
+_STOP_ADVICE = {
+    "credentials": "The RPC rejected the URL or API key. Check SOLANA_RPC_URL (the full Helius URL including "
+                   "?api-key=...) and run `source .env`.",
+    "url": "Check SOLANA_RPC_URL: it should be the full https:// RPC URL from your Helius dashboard.",
+    "quota": "Your RPC plan's credits are used up for now. Trades read so far are saved. Wait for the plan to reset "
+             "(Helius: monthly), add credits, or use another RPC URL, then run the same command again.",
+    "transient": "The RPC kept failing (rate limits, server or network problems). Trades read so far are saved; "
+                 "wait a while and run the same command again (already-saved trades are skipped).",
+}
+
+
+def _rpc_from(url: str, rps: float | None = None):
+    from .solana_rpc import SolanaRpc
+
+    try:
+        return SolanaRpc(url, requests_per_second=rps)
+    except ValueError as e:
+        sys.exit(f"SOLANA_RPC_URL problem: {e}. If you made .env in Notepad, re-save it and run `source .env`.")
+
+
 async def cmd_backfill(args, cfg: Config) -> None:
-    from .solana_rpc import RpcHTTPError, SolanaRpc
-    from .sources.rpc_backfill import backfill_wallet
+    from .solana_rpc import RpcError, RpcHTTPError
+    from .sources.rpc_backfill import BackfillResult, backfill_wallet
 
     wallets, _ = _read_wallets(args.wallets)
-    if not wallets:
-        sys.exit(f"{args.wallets} has no wallet addresses in it")
-    rpc = SolanaRpc(args.rpc or os.environ.get("SOLANA_RPC_URL") or cfg.live.rpc_url, requests_per_second=args.rps)
+    rpc = _rpc_from(args.rpc or os.environ.get("SOLANA_RPC_URL") or cfg.live.rpc_url, args.rps)
     print(f"Reading history from {rpc.host}, up to {rpc.requests_per_second:g} requests/second.")
     if rpc.is_public:
         print("  This is Solana's free public RPC: slow and heavily rate limited. To use your Helius key,\n"
               "  run `source .env` first (or set SOLANA_RPC_URL).", file=sys.stderr)
     store = Store(cfg.db_path)
     total_new = 0
+    done_wallets = 0
+    skipped: list[str] = []
+    failures_in_a_row = 0
+    stop: RpcHTTPError | None = None
     try:
         for i, w in enumerate(wallets, 1):
             label = f"[{i}/{len(wallets)}] {short(w)}"
-
-            def show(done: int, total: int, trades: int, label: str = label) -> None:
-                print(f"\r{label}: {done}/{total} transactions read, {trades} trades found", end="", flush=True)
-
-            res = await backfill_wallet(rpc, w, max_signatures=args.limit, progress=show)
+            res = BackfillResult()
+            try:
+                await backfill_wallet(
+                    rpc, w, max_signatures=args.limit, result=res,
+                    progress=lambda d, t, n, label=label: PROGRESS.show(
+                        f"{label}: {d}/{t} transactions read, {n} trades found"))
+            except (RpcHTTPError, RpcError) as e:
+                total_new += store.add_trades(res.trades)
+                if isinstance(e, RpcHTTPError) and e.fatal:
+                    stop = e
+                    break
+                PROGRESS.show(f"{label}: skipped, could not list its transactions ({e})")
+                PROGRESS.end()
+                skipped.append(w)
+                failures_in_a_row += 1
+                if failures_in_a_row >= 3 or done_wallets == 0 and failures_in_a_row == len(wallets):
+                    stop = e if isinstance(e, RpcHTTPError) else RpcHTTPError(None, str(e))
+                    break
+                continue
+            except asyncio.CancelledError:  # Ctrl-C: keep what this wallet has so far, then stop
+                n = store.add_trades(res.trades)
+                PROGRESS.end()
+                print(f"Stopped. Saved {total_new + n} new trades, including {n} from the wallet in progress. "
+                      f"Run the same command again to continue.", file=sys.stderr)
+                raise
+            failures_in_a_row = 0
+            done_wallets += 1
             n = store.add_trades(res.trades)
             total_new += n
-            line = f"\r{label}: {len(res.trades)} trades from {res.transactions} transactions ({n} new)"
+            line = f"{label}: {len(res.trades)} trades from {res.transactions} transactions ({n} new)"
             if res.unreadable:
                 why = ", ".join(f"{c} {r}" for r, c in res.unreadable.most_common())
                 line += f"; {sum(res.unreadable.values())} unreadable ({why})"
-            print(line + " " * 10)
-    except RpcHTTPError as e:
-        print()
-        sys.exit(f"The RPC refused the request: {e}\n"
-                 "Check SOLANA_RPC_URL (the full Helius URL including ?api-key=...) and run `source .env`.")
+            PROGRESS.show(line)
+            PROGRESS.end()
+            if res.stopped is not None:
+                stop = res.stopped
+                break
     finally:
+        PROGRESS.end()
         await rpc.aclose()
+    print(f"{total_new} new trades saved to {cfg.db_path}.")
+    if skipped:
+        print(f"{len(skipped)} wallet(s) were skipped because their transactions couldn't be listed; "
+              "run the same command again later to retry them.")
+    if stop is not None:
+        sys.exit(f"Stopped early: {stop}\n{_STOP_ADVICE.get(stop.kind, _STOP_ADVICE['transient'])}")
     if rpc.rate_limited:
         print(f"(the RPC asked us to slow down {rpc.rate_limited} times; if that number is large, "
-              f"try --rps {max(1, int(rpc.requests_per_second // 2))})")
-    print(f"Done: {total_new} new trades saved to {cfg.db_path}. Next: {_cmd('profile --wallets ' + args.wallets, cfg)}")
+              f"try --rps {rpc.requests_per_second / 2:g})")
+    print(f"Next: {_cmd('profile --wallets ' + shlex.quote(args.wallets), cfg)}")
 
 
 async def cmd_profile(args, cfg: Config) -> None:
@@ -268,10 +381,9 @@ async def cmd_run(args, cfg: Config) -> None:
         from solders.keypair import Keypair
 
         from .brokers.pumpportal import PumpPortalBroker
-        from .solana_rpc import SolanaRpc
 
-        rpc = SolanaRpc(os.environ.get("SOLANA_RPC_URL") or cfg.live.rpc_url)
-        kp = Keypair.from_base58_string(key)
+        rpc = _rpc_from(os.environ.get("SOLANA_RPC_URL") or cfg.live.rpc_url)
+        kp = Keypair.from_base58_string(key.strip())
         owner = str(kp.pubkey())
         broker = PumpPortalBroker(cfg, kp, rpc)
         balance = await rpc.get_balance_sol(owner)
@@ -427,6 +539,16 @@ async def cmd_pnl(args, cfg: Config) -> None:
     print("\n\n".join(format_pnl(r, cfg.db_path, recent=args.recent) for r in reports))
 
 
+def _positive_rate(text: str) -> float:
+    try:
+        v = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number, e.g. 5 or 0.5") from None
+    if not math.isfinite(v) or v <= 0:
+        raise argparse.ArgumentTypeError("must be a number greater than 0, e.g. 5 or 0.5")
+    return v
+
+
 def _nonneg_int(text: str) -> int:
     v = int(text)
     if v < 0:
@@ -475,7 +597,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("wallets", help="file with one address[,alias] per line")
     s.add_argument("--limit", type=int, default=500, help="max signatures per wallet")
     s.add_argument("--rpc", help="RPC URL (default: $SOLANA_RPC_URL or [live].rpc_url)")
-    s.add_argument("--rps", type=float, default=None,
+    s.add_argument("--rps", type=_positive_rate, default=None,
                    help="max requests per second (default 8, or 3 on Solana's public RPC; Helius free allows 10)")
     s.set_defaults(fn=cmd_backfill)
 
@@ -516,6 +638,10 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(_EndProgressLine())
+    for noisy in ("httpx", "httpcore"):  # their INFO lines include request URLs, i.e. the RPC API key
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     cfg = load_config(args.config)
     if getattr(args, "db_path", None):
         cfg.db_path = args.db_path
@@ -523,6 +649,7 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(args.fn(args, cfg))
     except KeyboardInterrupt:
         # A forced quit (second Ctrl-C), or Ctrl-C outside `run`'s main loop.
+        PROGRESS.end()
         print("stopped", file=sys.stderr)
         sys.exit(130)
 

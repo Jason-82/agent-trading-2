@@ -22,6 +22,24 @@ MAX_BACKOFF_S = 30.0
 # "...try the request again with the following configuration parameter: "maxSupportedTransactionVersion": 1"
 _VERSION_HINT = re.compile(r'"maxSupportedTransactionVersion"\s*:\s*(\d+)')
 VERSION_UNSUPPORTED = -32015
+# Helius: 429 "max usage reached" once the plan's monthly credits are spent; Alchemy: "Monthly capacity limit exceeded".
+_QUOTA = re.compile(r"max usage|credit|quota|capacity limit|monthly limit", re.IGNORECASE)
+
+
+def clean_rpc_url(raw: str) -> str:
+    """Tidy an RPC URL copied into .env (stray quotes, Windows line endings)
+    and check it is a full http(s) URL. Errors never echo the URL, which
+    usually contains the API key."""
+    url = raw.strip().strip("\"'").strip()
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise ValueError("the RPC URL must be a full address starting with https://, "
+                         "e.g. https://mainnet.helius-rpc.com/?api-key=...")
+    return url
+
+
+def _excerpt(text: str, n: int = 120) -> str:
+    return " ".join(text.split())[:n]
 
 
 class RpcError(RuntimeError):
@@ -36,20 +54,22 @@ class RpcError(RuntimeError):
 class RpcHTTPError(RuntimeError):
     """The RPC could not be reached or refused the request (after retries)."""
 
-    def __init__(self, status: int | None, message: str) -> None:
+    def __init__(self, status: int | None, message: str, *, kind: str = "transient") -> None:
         super().__init__(message)
         self.status = status
+        # transient: retry later | credentials: URL/key rejected | quota: plan's credits used up | url: not a usable RPC URL
+        self.kind = "credentials" if kind == "transient" and status in (401, 403, 404) else kind
 
     @property
     def fatal(self) -> bool:
-        """A bad URL or API key: retrying other requests won't help."""
-        return self.status in (401, 403, 404)
+        """Retrying other requests won't help until the user changes something."""
+        return self.kind != "transient"
 
 
 class SolanaRpc:
     def __init__(self, url: str, http: httpx.AsyncClient | None = None, max_retries: int = 5,
                  requests_per_second: float | None = None, backoff_s: float = 1.0) -> None:
-        self.url = url
+        self.url = clean_rpc_url(url)
         self.http = http or httpx.AsyncClient(timeout=30.0)
         self.max_retries = max_retries
         self.backoff_s = backoff_s
@@ -67,7 +87,7 @@ class SolanaRpc:
     @property
     def host(self) -> str:
         """Host only: safe to print (the URL's query string usually holds the API key)."""
-        return urlparse(self.url).hostname or self.url
+        return urlparse(self.url).hostname or "<invalid RPC URL>"
 
     @property
     def is_public(self) -> bool:
@@ -93,31 +113,50 @@ class SolanaRpc:
         for attempt in range(self.max_retries + 1):
             await self._throttle()
             wait = delay
+            r = None
             try:
                 if isinstance(body, str):
                     r = await self.http.post(self.url, content=body, headers={"Content-Type": "application/json"})
                 else:
                     r = await self.http.post(self.url, json=body)
+            except (httpx.InvalidURL, httpx.UnsupportedProtocol) as e:
+                raise RpcHTTPError(None, f"the RPC URL for {self.host} is not usable ({type(e).__name__})",
+                                   kind="url") from None
             except httpx.TransportError as e:
-                problem = RpcHTTPError(None, f"could not reach the RPC at {self.host}: {e!r}")
+                problem = RpcHTTPError(None, f"could not reach the RPC at {self.host}: {type(e).__name__}")
             else:
-                if r.status_code == 429 or r.status_code >= 500:
-                    if r.status_code == 429:
-                        self.rate_limited += 1
-                        problem = RpcHTTPError(429, f"HTTP 429 from {self.host}: rate limited by the RPC provider")
-                    else:
-                        problem = RpcHTTPError(r.status_code, f"HTTP {r.status_code} from {self.host} (server error)")
-                    retry_after = r.headers.get("retry-after", "")
-                    if retry_after.replace(".", "", 1).isdigit():
-                        wait = max(wait, float(retry_after))
+                if r.status_code == 429:
+                    if _QUOTA.search(r.text):
+                        raise RpcHTTPError(429, f"HTTP 429 from {self.host}: the RPC plan's credits are used up "
+                                                f"({_excerpt(r.text)})", kind="quota")
+                    self.rate_limited += 1
+                    problem = RpcHTTPError(429, f"HTTP 429 from {self.host}: rate limited by the RPC provider")
+                elif r.status_code >= 500:
+                    problem = RpcHTTPError(r.status_code, f"HTTP {r.status_code} from {self.host} (server error)"
+                                                          f"{': ' + _excerpt(r.text) if r.text.strip() else ''}")
+                elif 300 <= r.status_code < 400:
+                    loc = urlparse(r.headers.get("location", ""))
+                    where = f"{loc.scheme}://{loc.hostname}" if loc.hostname else "another address"
+                    raise RpcHTTPError(r.status_code, f"HTTP {r.status_code} from {self.host}: the RPC redirects to "
+                                                      f"{where}; put that https:// URL in SOLANA_RPC_URL", kind="url")
                 elif r.status_code >= 400:
-                    raise RpcHTTPError(r.status_code, f"HTTP {r.status_code} from {self.host}: {r.text[:200]}")
+                    raise RpcHTTPError(r.status_code, f"HTTP {r.status_code} from {self.host}: {_excerpt(r.text, 200)}")
                 else:
-                    data = r.json()
+                    try:
+                        data = r.json()
+                    except ValueError:
+                        data = None
+                    if not isinstance(data, dict):
+                        raise RpcHTTPError(r.status_code, f"{self.host} did not answer like a Solana RPC "
+                                                          "(is SOLANA_RPC_URL the RPC URL, not a web page?)", kind="url")
                     if "error" in data:
                         err = data["error"] or {}
                         raise RpcError(err.get("code"), str(err.get("message", err)))
                     return data.get("result")
+            if r is not None and r.status_code in (429, 503):
+                retry_after = r.headers.get("retry-after", "")
+                if retry_after.replace(".", "", 1).isdigit():
+                    wait = max(wait, float(retry_after))
             if attempt == self.max_retries:
                 raise problem
             await asyncio.sleep(min(wait, MAX_BACKOFF_S))
