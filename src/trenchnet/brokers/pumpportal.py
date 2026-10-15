@@ -26,7 +26,7 @@ class PumpPortalBroker:
     mode = "live"
 
     def __init__(self, cfg: Config, keypair, rpc: SolanaRpc, http: httpx.AsyncClient | None = None) -> None:
-        from solders.keypair import Keypair  # optional dependency: pip install trenchnet[live]
+        from solders.keypair import Keypair
 
         if not isinstance(keypair, Keypair):
             raise TypeError("keypair must be a solders Keypair")

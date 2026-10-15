@@ -16,17 +16,25 @@ also pays a small tip is still a transfer. Transactions touching several
 tokens at once are skipped rather than guessed. Tips paid alongside a real
 trade remain inside its SOL amount.
 
-This makes one getTransaction call per signature; use a paid RPC for large
-backfills.
+Transactions of every version (legacy, v0, and v1 from Sept 2026) are read.
+Large v1 transactions can only be returned in raw base64 form; those are
+decoded locally with solders.
+
+This makes one getTransaction call per signature, paced to the RPC's rate
+limit; a free Helius key handles a 1,000-transaction wallet in a few minutes.
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import logging
-from typing import Any
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from ..models import Side, Trade
-from ..solana_rpc import LAMPORTS_PER_SOL, SolanaRpc
+from ..solana_rpc import VERSION_UNSUPPORTED, LAMPORTS_PER_SOL, RpcError, RpcHTTPError, SolanaRpc
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +44,29 @@ MIN_SOL_MOVE = 0.001
 
 def _key(k: Any) -> str:
     return k["pubkey"] if isinstance(k, dict) else str(k)
+
+
+def account_keys(tx: dict) -> list[str]:
+    """All account addresses in index order, for any encoding.
+
+    jsonParsed lists lookup-table addresses inside accountKeys already; the
+    json and base64 encodings list only the message's own keys, and the
+    loaded addresses (v0 lookup tables) follow them: writable, then read-only."""
+    t = tx["transaction"]
+    if isinstance(t, list):  # ["<base64>", "base64"]
+        from solders.transaction import VersionedTransaction
+
+        msg = VersionedTransaction.from_bytes(base64.b64decode(t[0])).message
+        keys = [str(k) for k in msg.account_keys]
+        parsed = False
+    else:
+        raw = t["message"]["accountKeys"]
+        keys = [_key(k) for k in raw]
+        parsed = bool(raw) and isinstance(raw[0], dict)
+    if not parsed:
+        loaded = (tx.get("meta") or {}).get("loadedAddresses") or {}
+        keys += list(loaded.get("writable") or []) + list(loaded.get("readonly") or [])
+    return keys
 
 
 def _token_amounts(balances: list[dict] | None, owner: str) -> dict[str, float]:
@@ -57,7 +88,7 @@ def parse_wallet_tx(tx: dict | None, wallet: str, signature: str) -> list[Trade]
     if not tx or not tx.get("meta") or tx["meta"].get("err") is not None:
         return []
     meta = tx["meta"]
-    keys = [_key(k) for k in tx["transaction"]["message"]["accountKeys"]]
+    keys = account_keys(tx)
     if wallet not in keys:
         return []
     i = keys.index(wallet)
@@ -99,7 +130,39 @@ def parse_wallet_tx(tx: dict | None, wallet: str, signature: str) -> list[Trade]
                   token_amount=abs(d), ts=float(ts), source="rpc")]
 
 
-async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500) -> list[Trade]:
+@dataclass
+class BackfillResult:
+    trades: list[Trade] = field(default_factory=list)
+    transactions: int = 0  # successful transactions examined
+    unreadable: Counter = field(default_factory=Counter)  # reason -> count, after retries
+
+
+async def fetch_transaction(rpc: SolanaRpc, signature: str) -> dict | None:
+    """jsonParsed when the node can produce it; otherwise the raw base64 form
+    (needed for large v1 transactions)."""
+    try:
+        return await rpc.get_transaction(signature)
+    except RpcError as e:
+        if e.code == VERSION_UNSUPPORTED:
+            raise
+        return await rpc.get_transaction(signature, encoding="base64")
+
+
+def _reason(e: Exception) -> str:
+    if isinstance(e, RpcHTTPError):
+        return f"HTTP {e.status}" if e.status else "network error"
+    if isinstance(e, RpcError):
+        return f"RPC error {e.code}"
+    return type(e).__name__
+
+
+async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500,
+                          progress: Callable[[int, int, int], None] | None = None,
+                          retry_pause_s: float = 10.0) -> BackfillResult:
+    """Read up to `max_signatures` of the wallet's most recent successful
+    transactions. Transactions that fail temporarily (rate limits, network)
+    are retried once at the end. A rejected URL or API key raises
+    RpcHTTPError immediately."""
     sigs: list[str] = []
     before = None
     while len(sigs) < max_signatures:
@@ -110,12 +173,45 @@ async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500
         before = page[-1]["signature"]
         if len(page) < 1000:
             break
-    trades: list[Trade] = []
-    for n, sig in enumerate(sigs, 1):
-        try:
-            trades += parse_wallet_tx(await rpc.get_transaction(sig), wallet, sig)
-        except Exception as e:  # noqa: BLE001 - one bad transaction should not stop a backfill
-            log.warning("skip %s: %s", sig, e)
-        if n % 100 == 0:
-            log.info("%s: %d/%d transactions, %d trades", wallet[:6], n, len(sigs), len(trades))
-    return trades
+    sigs = sigs[:max_signatures]
+
+    res = BackfillResult()
+    warned: set[str] = set()
+
+    async def read(batch: list[str], show_progress: bool) -> dict[str, Exception]:
+        failed: dict[str, Exception] = {}
+        for n, sig in enumerate(batch, 1):
+            try:
+                tx = await fetch_transaction(rpc, sig)
+                try:
+                    found = parse_wallet_tx(tx, wallet, sig)
+                except (KeyError, TypeError, IndexError, ValueError):
+                    # Unfamiliar readable layout (a new transaction format?): decode the raw form instead.
+                    found = parse_wallet_tx(await rpc.get_transaction(sig, encoding="base64"), wallet, sig)
+                res.transactions += 1
+                res.trades += found
+            except RpcHTTPError as e:
+                if e.fatal:
+                    raise
+                failed[sig] = e
+            except Exception as e:  # noqa: BLE001 - one bad transaction should not stop a backfill
+                failed[sig] = e
+            if sig in failed:
+                reason = _reason(failed[sig])
+                if reason not in warned:  # one line per kind of problem, not one per transaction
+                    warned.add(reason)
+                    log.warning("some transactions could not be read (%s), e.g. %s: %s", reason, sig, failed[sig])
+            if progress and show_progress:
+                progress(n, len(batch), len(res.trades))
+        return failed
+
+    failed = await read(sigs, show_progress=True)
+    transient = [s for s, e in failed.items() if isinstance(e, RpcHTTPError)]
+    if transient:
+        log.info("retrying %d transactions after a pause", len(transient))
+        await asyncio.sleep(retry_pause_s)
+        for s in transient:
+            failed.pop(s)
+        failed.update(await read(transient, show_progress=False))
+    res.unreadable = Counter(_reason(e) for e in failed.values())
+    return res

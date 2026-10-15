@@ -14,11 +14,12 @@ dependencies = [
     "pydantic>=2.7",
     "websockets>=13",
     "httpx>=0.27",
+    "solders>=0.29",  # decodes v1 (Sept 2026) transactions; signs live orders
 ]
 
 [project.optional-dependencies]
-live = ["solders>=0.21"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "solders>=0.21"]
+live = []  # kept so older install commands still work; solders is now always installed
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 trenchnet = "trenchnet.cli:main"

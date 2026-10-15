@@ -140,19 +140,44 @@ async def cmd_import(args, cfg: Config) -> None:
 
 
 async def cmd_backfill(args, cfg: Config) -> None:
-    from .solana_rpc import SolanaRpc
+    from .solana_rpc import RpcHTTPError, SolanaRpc
     from .sources.rpc_backfill import backfill_wallet
 
     wallets, _ = _read_wallets(args.wallets)
-    rpc = SolanaRpc(args.rpc or os.environ.get("SOLANA_RPC_URL") or cfg.live.rpc_url)
+    if not wallets:
+        sys.exit(f"{args.wallets} has no wallet addresses in it")
+    rpc = SolanaRpc(args.rpc or os.environ.get("SOLANA_RPC_URL") or cfg.live.rpc_url, requests_per_second=args.rps)
+    print(f"Reading history from {rpc.host}, up to {rpc.requests_per_second:g} requests/second.")
+    if rpc.is_public:
+        print("  This is Solana's free public RPC: slow and heavily rate limited. To use your Helius key,\n"
+              "  run `source .env` first (or set SOLANA_RPC_URL).", file=sys.stderr)
     store = Store(cfg.db_path)
+    total_new = 0
     try:
-        for w in wallets:
-            trades = await backfill_wallet(rpc, w, max_signatures=args.limit)
-            n = store.add_trades(trades)
-            print(f"{short(w)}: {len(trades)} trades parsed, {n} new")
+        for i, w in enumerate(wallets, 1):
+            label = f"[{i}/{len(wallets)}] {short(w)}"
+
+            def show(done: int, total: int, trades: int, label: str = label) -> None:
+                print(f"\r{label}: {done}/{total} transactions read, {trades} trades found", end="", flush=True)
+
+            res = await backfill_wallet(rpc, w, max_signatures=args.limit, progress=show)
+            n = store.add_trades(res.trades)
+            total_new += n
+            line = f"\r{label}: {len(res.trades)} trades from {res.transactions} transactions ({n} new)"
+            if res.unreadable:
+                why = ", ".join(f"{c} {r}" for r, c in res.unreadable.most_common())
+                line += f"; {sum(res.unreadable.values())} unreadable ({why})"
+            print(line + " " * 10)
+    except RpcHTTPError as e:
+        print()
+        sys.exit(f"The RPC refused the request: {e}\n"
+                 "Check SOLANA_RPC_URL (the full Helius URL including ?api-key=...) and run `source .env`.")
     finally:
         await rpc.aclose()
+    if rpc.rate_limited:
+        print(f"(the RPC asked us to slow down {rpc.rate_limited} times; if that number is large, "
+              f"try --rps {max(1, int(rpc.requests_per_second // 2))})")
+    print(f"Done: {total_new} new trades saved to {cfg.db_path}. Next: {_cmd('profile --wallets ' + args.wallets, cfg)}")
 
 
 async def cmd_profile(args, cfg: Config) -> None:
@@ -450,6 +475,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("wallets", help="file with one address[,alias] per line")
     s.add_argument("--limit", type=int, default=500, help="max signatures per wallet")
     s.add_argument("--rpc", help="RPC URL (default: $SOLANA_RPC_URL or [live].rpc_url)")
+    s.add_argument("--rps", type=float, default=None,
+                   help="max requests per second (default 8, or 3 on Solana's public RPC; Helius free allows 10)")
     s.set_defaults(fn=cmd_backfill)
 
     s = command("profile", help="compute stats, profile wallets and select the roster")

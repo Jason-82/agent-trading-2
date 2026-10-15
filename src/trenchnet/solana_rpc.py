@@ -1,51 +1,128 @@
-"""Minimal async Solana JSON-RPC client (standard methods only)."""
+"""Minimal async Solana JSON-RPC client (standard methods only).
+
+Requests are paced to stay under the provider's rate limit (Helius' free
+plan allows 10 requests/second), and 429 / 5xx answers are retried with
+backoff, honouring Retry-After when the provider sends it.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import itertools
+import re
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 LAMPORTS_PER_SOL = 1_000_000_000
+PUBLIC_RPC_HOSTS = ("api.mainnet-beta.solana.com",)
+MAX_BACKOFF_S = 30.0
+
+# "...try the request again with the following configuration parameter: "maxSupportedTransactionVersion": 1"
+_VERSION_HINT = re.compile(r'"maxSupportedTransactionVersion"\s*:\s*(\d+)')
+VERSION_UNSUPPORTED = -32015
 
 
 class RpcError(RuntimeError):
-    pass
+    """The RPC answered, but with a JSON-RPC error."""
+
+    def __init__(self, code: int | None, message: str) -> None:
+        super().__init__(f"RPC error {code}: {message}")
+        self.code = code
+        self.message = message
+
+
+class RpcHTTPError(RuntimeError):
+    """The RPC could not be reached or refused the request (after retries)."""
+
+    def __init__(self, status: int | None, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def fatal(self) -> bool:
+        """A bad URL or API key: retrying other requests won't help."""
+        return self.status in (401, 403, 404)
 
 
 class SolanaRpc:
-    def __init__(self, url: str, http: httpx.AsyncClient | None = None, max_retries: int = 3) -> None:
+    def __init__(self, url: str, http: httpx.AsyncClient | None = None, max_retries: int = 5,
+                 requests_per_second: float | None = None, backoff_s: float = 1.0) -> None:
         self.url = url
         self.http = http or httpx.AsyncClient(timeout=30.0)
         self.max_retries = max_retries
+        self.backoff_s = backoff_s
+        if requests_per_second is None:
+            requests_per_second = 3.0 if self.is_public else 8.0
+        self.requests_per_second = requests_per_second
+        self._interval = 1.0 / requests_per_second if requests_per_second > 0 else 0.0
+        self._next_slot = 0.0
+        self._pace = asyncio.Lock()
         self._ids = itertools.count(1)
+        # Solana added transaction format v1 in Sept 2026; raised automatically if a newer one appears.
+        self.max_tx_version = 1
+        self.rate_limited = 0  # 429 answers seen, for reporting
+
+    @property
+    def host(self) -> str:
+        """Host only: safe to print (the URL's query string usually holds the API key)."""
+        return urlparse(self.url).hostname or self.url
+
+    @property
+    def is_public(self) -> bool:
+        return self.host in PUBLIC_RPC_HOSTS
+
+    async def _throttle(self) -> None:
+        if not self._interval:
+            return
+        async with self._pace:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            if self._next_slot > now:
+                await asyncio.sleep(self._next_slot - now)
+                now = loop.time()
+            self._next_slot = max(now, self._next_slot) + self._interval
 
     async def call(self, method: str, params: list[Any] | None = None) -> Any:
         body = {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params or []}
         return await self.post_raw(body)
 
     async def post_raw(self, body: dict | str) -> Any:
-        delay = 0.5
+        delay = self.backoff_s
         for attempt in range(self.max_retries + 1):
+            await self._throttle()
+            wait = delay
             try:
                 if isinstance(body, str):
                     r = await self.http.post(self.url, content=body, headers={"Content-Type": "application/json"})
                 else:
                     r = await self.http.post(self.url, json=body)
+            except httpx.TransportError as e:
+                problem = RpcHTTPError(None, f"could not reach the RPC at {self.host}: {e!r}")
+            else:
                 if r.status_code == 429 or r.status_code >= 500:
-                    raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
-                r.raise_for_status()
-                data = r.json()
-                if "error" in data:
-                    raise RpcError(str(data["error"]))
-                return data.get("result")
-            except (httpx.TransportError, httpx.HTTPStatusError):
-                if attempt == self.max_retries:
-                    raise
-                await asyncio.sleep(delay)
-                delay *= 2
+                    if r.status_code == 429:
+                        self.rate_limited += 1
+                        problem = RpcHTTPError(429, f"HTTP 429 from {self.host}: rate limited by the RPC provider")
+                    else:
+                        problem = RpcHTTPError(r.status_code, f"HTTP {r.status_code} from {self.host} (server error)")
+                    retry_after = r.headers.get("retry-after", "")
+                    if retry_after.replace(".", "", 1).isdigit():
+                        wait = max(wait, float(retry_after))
+                elif r.status_code >= 400:
+                    raise RpcHTTPError(r.status_code, f"HTTP {r.status_code} from {self.host}: {r.text[:200]}")
+                else:
+                    data = r.json()
+                    if "error" in data:
+                        err = data["error"] or {}
+                        raise RpcError(err.get("code"), str(err.get("message", err)))
+                    return data.get("result")
+            if attempt == self.max_retries:
+                raise problem
+            await asyncio.sleep(min(wait, MAX_BACKOFF_S))
+            delay = min(delay * 2, MAX_BACKOFF_S)
+        raise AssertionError("unreachable")
 
     async def get_balance_sol(self, owner: str) -> float:
         res = await self.call("getBalance", [owner, {"commitment": "confirmed"}])
@@ -89,10 +166,21 @@ class SolanaRpc:
             opts["before"] = before
         return await self.call("getSignaturesForAddress", [address, opts]) or []
 
-    async def get_transaction(self, signature: str) -> dict | None:
-        return await self.call("getTransaction", [
-            signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"},
-        ])
+    async def get_transaction(self, signature: str, encoding: str = "jsonParsed") -> dict | None:
+        """Fetch a transaction of any version. If the node says a newer
+        transaction version exists, opt in to it and ask again."""
+        while True:
+            try:
+                return await self.call("getTransaction", [signature, {
+                    "encoding": encoding, "maxSupportedTransactionVersion": self.max_tx_version,
+                    "commitment": "confirmed",
+                }])
+            except RpcError as e:
+                hint = _VERSION_HINT.search(e.message) if e.code == VERSION_UNSUPPORTED else None
+                if hint and int(hint.group(1)) > self.max_tx_version:
+                    self.max_tx_version = int(hint.group(1))
+                    continue
+                raise
 
     async def aclose(self) -> None:
         await self.http.aclose()
