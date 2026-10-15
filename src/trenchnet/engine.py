@@ -151,7 +151,9 @@ class Engine:
                                   route=decision.route, reasons=decision.reasons, assessment=a, source=source)
         self.out(
             f"[{iso(t.ts)}] {short(t.mint)} {snap['event']['ref']} {self.name(t.wallet)} {t.side.value} "
-            f"{t.sol_amount:.3f} SOL | fit={a['behavior_fit']} intent={a['position_intent']} "
+            f"{t.sol_amount:.3f} SOL"
+            + (f" (${t.quote_amount:,.2f} in stablecoin)" if t.quote_mint and t.quote_amount is not None else "")
+            + f" | fit={a['behavior_fit']} intent={a['position_intent']} "
             f"history={a['history']} -> {decision.route}"
             + (" (uncertain)" if decision.uncertain else "")
         )

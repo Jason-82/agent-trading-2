@@ -99,10 +99,10 @@ class SolUsdPrices:
     """Look up SOL/USD for past times; fetch what's needed first with prefetch()."""
 
     def __init__(self, store: "Store | None" = None, http: httpx.AsyncClient | None = None,
-                 sources: Iterable[PriceSource] = SOURCES, now: Callable[[], float] = time.time) -> None:
+                 sources: Iterable[PriceSource] | None = None, now: Callable[[], float] = time.time) -> None:
         self.store = store
         self._http = http
-        self.sources = list(sources)
+        self.sources = list(sources if sources is not None else SOURCES)
         self.now = now
         self._cache: dict[int, float] = {}
         self._asked: set[int] = set()  # buckets already requested this run (incl. ones with no candle)

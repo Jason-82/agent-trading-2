@@ -72,9 +72,10 @@ stop, and records the "A buys then sells immediately" case without analysis.
 ## Using it with real wallets
 
 1. **Pick candidates.** Put addresses in `wallets.txt` (`address[,alias]` per
-   line; see `examples/wallets.example.txt`). Leaderboards on pump.fun, Fomo,
-   GMGN or Birdeye are reasonable sources; the selection criteria decide who
-   actually makes the roster.
+   line; see `examples/wallets.example.txt`). Leaderboards on pump.fun, GMGN or
+   Birdeye are reasonable sources; the selection criteria decide who
+   actually makes the roster. For traders using the Fomo app, see
+   [Fomo traders](#fomo-traders) below.
 2. **Backfill history** from any Solana RPC (a paid endpoint such as Helius or
    QuickNode is recommended, it makes one call per transaction):
    ```bash
@@ -85,10 +86,16 @@ stop, and records the "A buys then sells immediately" case without analysis.
    progress line per wallet with why any transactions were skipped, and skips any
    line in `wallets.txt` that isn't a wallet address. If it stops early
    (credits used up, provider down) the trades read so far are kept; run the
-   same command again later and already-saved trades are skipped. Add
-   `--new-only` to download only wallets you haven't downloaded before, or
-   `--refresh` to re-read every wallet and replace its downloaded history
-   (worth doing after an update to the reader).
+   same command again later to continue. Running it again re-reads each
+   wallet's recent transactions and updates what was saved for them (so a
+   newer version of the reader corrects older entries), while older history
+   and trades seen live are kept. Add `--new-only` to download only wallets
+   you haven't downloaded before.
+
+   Trades paid in USDC (or USDT/USD1) instead of SOL, as on Fomo and on
+   USDC-paired pump.fun coins, are counted too: each is valued in SOL at the
+   SOL/USD price of its time, taken from Coinbase's or Binance's public price
+   history (no key needed; downloaded once and kept in the database).
    `trenchnet inspect <wallet or nickname>` shows, transaction by transaction,
    what the reader made of a wallet's recent activity.
    Or import your own data: `trenchnet import trades.jsonl` (format in
@@ -96,7 +103,10 @@ stop, and records the "A buys then sells immediately" case without analysis.
 3. **Profile and select:** `trenchnet profile --wallets wallets.txt`, then
    `trenchnet roster --all` to see who was kept and why.
 4. **Paper trade live data:** `export PUMPPORTAL_API_KEY=...` then
-   `trenchnet run`. Reports: `trenchnet reports --mint <MINT>`.
+   `trenchnet run`. With `SOLANA_RPC_URL` set it also watches the wallets
+   through your RPC's websocket, which sees trades PumpPortal doesn't report
+   under the wallet (aggregator routes, every Fomo trade); `--no-rpc-watch`
+   turns that off. Reports: `trenchnet reports --mint <MINT>`.
 5. **Check results** at any time, even while the bot is stopped:
    ```bash
    trenchnet pnl                 # all time
@@ -120,6 +130,33 @@ Everything the bot records (trades, roster, reports, its own fills) is in
 `--db FILE` to use a different file.
 
 Configuration lives in `trenchnet.toml` (copy `examples/trenchnet.example.toml`).
+
+## Fomo traders
+
+The Fomo app doesn't show its traders' wallet addresses, and its terms forbid
+scraping the app or looking users up. Their trades are still ordinary Solana
+transactions, though: Fomo pays every user's network fee from one sponsor
+wallet and takes its app fee in USDC into one account. `trenchnet fomo`
+reads a sample of that account's recent transactions through your own RPC
+and lists who traded, by volume:
+
+```bash
+trenchnet fomo                                # ~300 RPC calls, about a minute
+trenchnet backfill fomo.txt --limit 500       # their history
+trenchnet profile --wallets fomo.txt          # keeps only the profitable ones
+trenchnet roster --all
+```
+
+The wallets go into `fomo.txt` with nicknames like `fomo-9xQe`; running it
+again adds new ones. A short sample shows who is active and trades size, not
+who trades well; `profile` decides that from each wallet's full history,
+with the same criteria as everyone else. Names (which wallet is which Fomo
+user) aren't available this way. If you know a particular trader's address,
+add it to `fomo.txt` yourself.
+
+Fomo sends its users' trades through its sponsor, so the trader's own
+address can be missing from them. The backfill therefore also reads each
+wallet's USDC account, and `trenchnet run` watches it too.
 
 ## Live trading
 
@@ -154,10 +191,16 @@ Use a fresh wallet holding only what you are prepared to lose.
 - **Past profitability is weak evidence** for memecoins: survivorship,
   one-off winners and unrealized gains all flatter a wallet. The selection
   criteria and profiles try to expose this; they cannot remove it.
-- **Fomo** has no official public trading API. An independent data API
-  (fomoapi.io) reportedly exposes Fomo trader PnL and feeds, which could feed
-  step 1, but I could not verify its schema. Automating the Fomo app itself
-  would likely breach its terms. Execution here is pump.fun via PumpPortal.
+- **Fomo** has no official public trading API, and automating or scraping
+  the app would breach its terms; `trenchnet fomo` only reads public
+  blockchain data. The bot follows Fomo traders but its own orders go to
+  pump.fun via PumpPortal, priced in SOL. Coins paired with USDC can be
+  followed and paper traded; whether PumpPortal can execute a live order on
+  a given USDC pair is up to PumpPortal. Price updates for exits come from
+  PumpPortal and from the followed wallets' own trades.
+- The Fomo account addresses `trenchnet fomo` uses come from DefiLlama's
+  open-source Fomo adapter. If it stops finding trades, Fomo has probably
+  changed them: `trenchnet fomo --account <address>`.
 - **PumpPortal** meters account/token-trade subscriptions (API key + funded
   PumpPortal wallet) and charges a fee per trade; check their current pricing.
 - Paper-trade for a meaningful period and compare against simply holding
@@ -172,8 +215,9 @@ src/trenchnet/
   cases.py judge.py reporter.py       snapshots, stage 3, stage 4
   strategy.py portfolio.py engine.py  trading rules, bot holdings, event loop
   pnl.py                              profit and loss report from stored fills
+  prices.py fomo.py                   SOL/USD history, Fomo trader discovery
   brokers/  paper.py pumpportal.py    execution
-  sources/  pumpportal_ws.py rpc_backfill.py replay.py synthetic.py
+  sources/  pumpportal_ws.py rpc_ws.py rpc_backfill.py replay.py synthetic.py
   llm.py solana_rpc.py store.py config.py cli.py
 tests/                                offline tests (fake LLM client, local websocket)
 ```

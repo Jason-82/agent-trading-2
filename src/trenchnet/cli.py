@@ -521,7 +521,7 @@ async def cmd_fomo(args, cfg: Config) -> None:
         args.out, top, lambda t: f"Fomo sample {when}: {t.trades} trades, ${t.usd:,.0f}")
     print(f"\nAdded {added} wallets to {args.out}" + (f" ({already} were already there)" if already else "")
           + ". Volume in a short sample says who is active and trades size, not who trades well:")
-    print(f"  {_cmd('backfill ' + shlex.quote(args.out) + ' --limit 500', cfg)}     # their history (~1 min per wallet)")
+    print(f"  {_cmd('backfill ' + shlex.quote(args.out) + ' --limit 500', cfg)}     # their history (~2 min per wallet)")
     print(f"  {_cmd('profile --wallets ' + shlex.quote(args.out), cfg)}        # keeps only the profitable ones")
 
 
@@ -589,7 +589,9 @@ async def cmd_replay(args, cfg: Config) -> None:
 
 
 async def cmd_run(args, cfg: Config) -> None:
+    from .prices import SolUsdPrices
     from .sources.pumpportal_ws import PumpPortalSource
+    from .sources.rpc_ws import RpcWalletSource, merge_events
 
     store = Store(cfg.db_path)
     tracked = _load_tracked(store)
@@ -599,6 +601,26 @@ async def cmd_run(args, cfg: Config) -> None:
         print(f"warning: {cfg.pumpportal.api_key_env} not set; PumpPortal requires an API key for "
               "account and token trade subscriptions", file=sys.stderr)
     source = PumpPortalSource(cfg.pumpportal, tracked.keys(), api_key)
+
+    # Also watch the wallets through the user's own RPC: it sees trades PumpPortal doesn't
+    # attribute to them (aggregator routes, Fomo's sponsored trades, USDC pairs).
+    watch_url = args.rpc or os.environ.get("SOLANA_RPC_URL")
+    watcher: RpcWalletSource | None = None
+    watch_rpc = None
+    prices = SolUsdPrices(store)
+    if watch_url and not args.no_rpc_watch:
+        watch_rpc = _rpc_from(watch_url)
+        watcher = RpcWalletSource(watch_rpc, tracked.keys(), ws_url=os.environ.get("SOLANA_WS_URL"), prices=prices)
+        print(f"also watching the wallets through {watcher.host} (sees trades PumpPortal doesn't report, "
+              "such as Fomo trades)")
+    elif not watch_url:
+        print("tip: set SOLANA_RPC_URL (your Helius URL) to also watch the wallets through your RPC; "
+              "trades made in the Fomo app are only seen that way", file=sys.stderr)
+
+    def stop_sources() -> None:
+        source.stop()
+        if watcher is not None:
+            watcher.stop()
 
     rpc = None
     owner = None
@@ -655,7 +677,7 @@ async def cmd_run(args, cfg: Config) -> None:
     if engine.portfolio.holdings:
         print(f"resumed {len(engine.portfolio.holdings)} open position(s)")
 
-    restore_signals = _install_stop_handlers(asyncio.get_running_loop(), source.stop)
+    restore_signals = _install_stop_handlers(asyncio.get_running_loop(), stop_sources)
 
     async def ticker() -> None:
         while True:
@@ -666,15 +688,20 @@ async def cmd_run(args, cfg: Config) -> None:
                 log.exception("tick failed; retrying in 30s")
 
     tick_task = asyncio.create_task(ticker())
+    events = merge_events(source, watcher) if watcher is not None else source.events()
     try:
-        async for ev in source.events():
+        async for ev in events:
             await engine.handle(ev)
     finally:
+        await events.aclose()
         tick_task.cancel()
         await engine.drain()
         engine.save_marks()
         if rpc is not None:
             await rpc.aclose()
+        if watch_rpc is not None:
+            await watch_rpc.aclose()
+        await prices.aclose()
         _print_summary(engine)
         print(f"Full history: {_cmd('pnl', cfg)}")
         restore_signals()
@@ -886,9 +913,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--no-llm", action="store_true")
     s.set_defaults(fn=cmd_replay)
 
-    s = command("run", help="follow the roster live via PumpPortal")
+    s = command("run", help="follow the roster live (PumpPortal, plus your RPC when SOLANA_RPC_URL is set)")
     s.add_argument("--live", action="store_true", help="place real orders (requires config + env opt-in)")
     s.add_argument("--no-llm", action="store_true")
+    s.add_argument("--rpc", help="RPC URL for watching wallets (default: $SOLANA_RPC_URL)")
+    s.add_argument("--no-rpc-watch", action="store_true", help="use PumpPortal only, not your RPC's websocket")
     s.set_defaults(fn=cmd_run)
 
     s = command("reports", help="show situation reports")
