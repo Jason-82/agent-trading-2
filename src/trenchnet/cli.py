@@ -4,6 +4,7 @@
     trenchnet import trades.jsonl      # load historical trades
     trenchnet backfill wallets.txt     # pull wallet history from a Solana RPC
     trenchnet inspect <wallet>         # how a wallet's recent transactions are read
+    trenchnet fomo                     # find wallets trading through the Fomo app
     trenchnet profile                  # stats + profiles + roster selection
     trenchnet roster                   # show the roster
     trenchnet replay events.jsonl      # backtest the pipeline on recorded events
@@ -460,6 +461,70 @@ async def cmd_inspect(args, cfg: Config) -> None:
             print("Saved in the database for this wallet: " + ", ".join(f"{c} {k}" for k, c in stored.most_common()))
 
 
+async def cmd_fomo(args, cfg: Config) -> None:
+    from .fomo import FOMO_FEE_ACCOUNT, discover, merge_wallet_file
+    from .prices import SolUsdPrices
+    from .solana_rpc import RpcError, RpcHTTPError
+
+    accounts = args.account or [FOMO_FEE_ACCOUNT]
+    rpc = _rpc_from(args.rpc or os.environ.get("SOLANA_RPC_URL") or cfg.live.rpc_url, args.rps)
+    store = Store(cfg.db_path)
+    prices = SolUsdPrices(store)
+    print(f"Listing the last {args.pages * 1000:,} transactions of Fomo's fee account "
+          f"{', '.join(short(a) for a in accounts)} (from {rpc.host}), then reading up to {args.sample} of them "
+          "spread over that period.")
+    try:
+        found = await discover(rpc, accounts, pages=args.pages, sample=args.sample, prices=prices,
+                               progress=lambda d, t, n: PROGRESS.show(f"{d}/{t} transactions read, {n} traders found"))
+    except (RpcHTTPError, RpcError) as e:
+        PROGRESS.end()
+        advice = _STOP_ADVICE.get(e.kind, "") if isinstance(e, RpcHTTPError) else ""
+        sys.exit(f"Could not list Fomo's transactions: {e}\n{advice}".rstrip())
+    finally:
+        PROGRESS.end()
+        await rpc.aclose()
+        await prices.aclose()
+
+    span = ""
+    if found.span:
+        span = f", from {iso(found.span[0])[:16]} to {iso(found.span[1])[:16]} UTC"
+    print(f"Read {found.read} of {found.listed:,} recent transactions{span}: {found.fomo_trades} trades "
+          f"by {len(found.traders)} wallets ({found.no_trade} other transactions: deposits, withdrawals, ...).")
+    if found.unreadable:
+        print("  unreadable: " + ", ".join(f"{c} {r}" for r, c in found.unreadable.most_common()))
+    if found.stopped is not None:
+        print(f"Stopped early: {found.stopped}", file=sys.stderr)
+    if not found.traders:
+        sys.exit("No Fomo trades were recognised. Fomo may have changed its fee account: open a recent Fomo trade on "
+                 "Solscan, find the USDC account the app fee went to, and pass it with --account ADDRESS.")
+    if found.found_by.get("signer"):
+        print(f"  ({found.found_by['signer']} traders were recognised as the transaction's other signer, "
+              "not by the fee payment)")
+    trades = sum(t.trades for t in found.traders.values())
+    own = sum(t.own_address_in_tx for t in found.traders.values())
+    if own < trades:
+        print(f"  In {trades - own} of {trades} trades the trader's own address wasn't in the transaction (only their "
+              "token accounts were); backfill reads those through the wallet's USDC account.")
+
+    ranked = [t for t in found.ranked() if t.trades >= args.min_trades]
+    print(f"\n{'#':>3}  {'wallet':<44}  {'trades':>6} {'buys':>5} {'sells':>5}  {'volume':>10}  tokens")
+    for i, t in enumerate(ranked[:args.show], 1):
+        print(f"{i:>3}  {t.wallet:<44}  {t.trades:>6} {t.buys:>5} {t.sells:>5}  {'$' + format(t.usd, ',.0f'):>10}  "
+              f"{len(t.tokens)}")
+    if len(ranked) > args.show:
+        print(f"  ... and {len(ranked) - args.show} more")
+    top = ranked[:args.top]
+    if not top:
+        sys.exit(f"No wallet made at least {args.min_trades} trades in the sample; try --min-trades 1 or a bigger --sample.")
+    when = iso(found.span[1])[:10] if found.span else "today"
+    added, already = merge_wallet_file(
+        args.out, top, lambda t: f"Fomo sample {when}: {t.trades} trades, ${t.usd:,.0f}")
+    print(f"\nAdded {added} wallets to {args.out}" + (f" ({already} were already there)" if already else "")
+          + ". Volume in a short sample says who is active and trades size, not who trades well:")
+    print(f"  {_cmd('backfill ' + shlex.quote(args.out) + ' --limit 500', cfg)}     # their history (~1 min per wallet)")
+    print(f"  {_cmd('profile --wallets ' + shlex.quote(args.out), cfg)}        # keeps only the profitable ones")
+
+
 async def cmd_profile(args, cfg: Config) -> None:
     store = Store(cfg.db_path)
     wallets, aliases = _read_wallets(args.wallets) if args.wallets else (None, {})
@@ -788,6 +853,22 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--limit", type=int, default=30, help="how many recent transactions (default 30)")
     s.add_argument("--rpc", help="RPC URL (default: $SOLANA_RPC_URL)")
     s.set_defaults(fn=cmd_inspect)
+
+    s = command("fomo", help="find wallets that trade through the Fomo app (from public blockchain data)")
+    s.add_argument("--sample", type=_positive_int, default=300,
+                   help="how many recent Fomo transactions to read (default 300; one RPC call each)")
+    s.add_argument("--pages", type=_positive_int, default=3,
+                   help="spread the sample over the last N x 1,000 Fomo transactions (default 3)")
+    s.add_argument("--top", type=_positive_int, default=30, help="how many wallets to add to the file (default 30)")
+    s.add_argument("--min-trades", type=_positive_int, default=2,
+                   help="only wallets with at least this many trades in the sample (default 2)")
+    s.add_argument("--show", type=_nonneg_int, default=20, help="how many to list on screen (default 20)")
+    s.add_argument("--out", default="fomo.txt", help="wallets file to add them to (default fomo.txt)")
+    s.add_argument("--account", action="append", metavar="ADDRESS",
+                   help="Fomo account to sample instead of its USDC fee account (repeatable)")
+    s.add_argument("--rpc", help="RPC URL (default: $SOLANA_RPC_URL)")
+    s.add_argument("--rps", type=_positive_rate, default=None, help="max requests per second (default 5)")
+    s.set_defaults(fn=cmd_fomo)
 
     s = command("profile", help="compute stats, profile wallets and select the roster")
     s.add_argument("--wallets", help="limit to wallets in this file (address[,alias] per line)")
