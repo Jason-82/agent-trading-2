@@ -65,6 +65,12 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 CREATE INDEX IF NOT EXISTS reports_mint ON reports(mint, ts);
 
+CREATE TABLE IF NOT EXISTS prices (
+    mint TEXT PRIMARY KEY,
+    price_sol REAL NOT NULL,
+    ts REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS fills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mint TEXT NOT NULL,
@@ -200,6 +206,33 @@ class Store:
             }
             for r in self.db.execute(q, args)
         ]
+
+    # -- prices -------------------------------------------------------------
+
+    def save_price(self, mint: str, price_sol: float, ts: float) -> None:
+        """Remember the latest price seen for a token (used to value open positions)."""
+        self.db.execute(
+            "INSERT INTO prices VALUES (?,?,?) ON CONFLICT(mint) DO UPDATE SET"
+            " price_sol = excluded.price_sol, ts = excluded.ts WHERE excluded.ts >= prices.ts",
+            (mint, price_sol, ts),
+        )
+        self.db.commit()
+
+    def last_price(self, mint: str) -> tuple[float, float] | None:
+        """(price, ts) of the newest price we have: a saved price or a stored trade."""
+        best: tuple[float, float] | None = None
+        r = self.db.execute("SELECT price_sol, ts FROM prices WHERE mint = ?", (mint,)).fetchone()
+        if r is not None:
+            best = (r["price_sol"], r["ts"])
+        r = self.db.execute(
+            "SELECT * FROM trades WHERE mint = ? AND side IN ('buy', 'sell') ORDER BY ts DESC, rowid DESC LIMIT 1",
+            (mint,),
+        ).fetchone()
+        if r is not None:
+            t = self._row_to_trade(r)
+            if t.price is not None and (best is None or t.ts > best[1]):
+                best = (t.price, t.ts)
+        return best
 
     # -- fills --------------------------------------------------------------
 

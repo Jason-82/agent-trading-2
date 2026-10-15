@@ -38,13 +38,30 @@ template reports), so the pipeline runs without an API key.
 
 ## Quick start
 
+Needs Python 3.11 or newer.
+
 ```bash
-python -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"          # add ".[live]" only if you will trade real funds
+git clone https://github.com/Jason-82/agent-trading-2.git
+cd agent-trading-2
+
+# Create and activate a private Python environment for the project:
+python3 -m venv .venv && source .venv/bin/activate        # macOS / Linux
+python -m venv .venv && source .venv/Scripts/activate     # Windows, Git Bash
+# python -m venv .venv; .venv\Scripts\Activate.ps1        # Windows, PowerShell
+
+pip install -e ".[dev]"          # includes the live-trading extras and test tools
 pytest -q                        # offline test suite
 trenchnet demo                   # the article's A/B/C/D walkthrough, offline
 trenchnet demo --llm             # same, with Claude (needs ANTHROPIC_API_KEY)
 ```
+
+Activate the environment again in every new terminal (the `source ...activate`
+line) before running `trenchnet`. On Windows the command is `python`, not
+`python3`; if PowerShell refuses to run `Activate.ps1`, run
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.
+
+Setting keys: `export NAME="value"` in Git Bash, macOS or Linux;
+`$env:NAME = "value"` in PowerShell. They last until you close the terminal.
 
 The demo builds a roster from 30 days of synthetic history (keeping A–D,
 rejecting a scalper, a one-lucky-token wallet and a thin history), then
@@ -70,7 +87,21 @@ stop, and records the "A buys then sells immediately" case without analysis.
    `trenchnet roster --all` to see who was kept and why.
 4. **Paper trade live data:** `export PUMPPORTAL_API_KEY=...` then
    `trenchnet run`. Reports: `trenchnet reports --mint <MINT>`.
-5. **Backtest** recorded events: `trenchnet replay events.jsonl`.
+5. **Check results** at any time, even while the bot is stopped:
+   ```bash
+   trenchnet pnl                 # all time
+   trenchnet pnl --since 7d      # last week (also 24h, 2w, or a date like 2026-10-01)
+   trenchnet pnl --json          # for spreadsheets / scripts
+   ```
+   It shows realized P&L, win rate, best/worst trades, fees, P&L by day and
+   open positions valued at the last price the bot saw. Everything is in SOL,
+   so a positive number means the bot beat simply holding SOL. Paper and live
+   trades are reported separately.
+6. **Backtest** recorded events: `trenchnet replay events.jsonl`.
+
+Everything the bot records (trades, roster, reports, its own fills) is in
+`trenchnet.db` in the folder you run it from. Every command accepts
+`--db FILE` to use a different file.
 
 Configuration lives in `trenchnet.toml` (copy `examples/trenchnet.example.toml`).
 
@@ -124,6 +155,7 @@ src/trenchnet/
   profiler.py graph.py                stage 1 and stage 2
   cases.py judge.py reporter.py       snapshots, stage 3, stage 4
   strategy.py portfolio.py engine.py  trading rules, bot holdings, event loop
+  pnl.py                              profit and loss report from stored fills
   brokers/  paper.py pumpportal.py    execution
   sources/  pumpportal_ws.py rpc_backfill.py replay.py synthetic.py
   llm.py solana_rpc.py store.py config.py cli.py

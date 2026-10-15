@@ -178,6 +178,15 @@ class Engine:
         for mint in list(self.portfolio.holdings):
             if mint in self.cases:
                 await self._exits(self.cases[mint])
+        self.save_marks()
+
+    def save_marks(self) -> None:
+        """Persist the latest price of each held token so `trenchnet pnl` can
+        value open positions while the bot is stopped."""
+        for mint in self.portfolio.holdings:
+            case = self.cases.get(mint)
+            if case is not None and case.last_price is not None:
+                self.store.save_price(mint, case.last_price, case.last_price_ts or self.now)
 
     # -- reports ----------------------------------------------------------
 
