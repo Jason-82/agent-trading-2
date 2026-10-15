@@ -92,7 +92,20 @@ SKIP_REASONS = {
     "no_token_change": "no token balance change (SOL transfers, fees, other activity)",
     "several_tokens": "several tokens changed at once (multi-token swap or batch)",
     "no_time": "no block time",
+    "unrelated_transfer": "tokens received or sent that the wallet never bought or sold (usually spam airdrops)",
 }
+
+
+def drop_unrelated_transfers(res: "BackfillResult") -> None:
+    """Keep transfers only for tokens the wallet also bought or sold in the
+    downloaded history. Well-known wallets receive a steady stream of spam
+    tokens; those aren't trading activity."""
+    traded = {t.mint for t in res.trades if t.side.is_trade}
+    kept = [t for t in res.trades if t.side.is_trade or t.mint in traded]
+    dropped = len(res.trades) - len(kept)
+    if dropped:
+        res.trades = kept
+        res.ignored["unrelated_transfer"] += dropped
 
 
 @dataclass
@@ -113,9 +126,10 @@ def analyze_wallet_tx(tx: dict | None, wallet: str, signature: str) -> TxView:
     if wallet not in keys:
         return TxView("not_in_tx")
     i = keys.index(wallet)
-    sol_delta = (meta["postBalances"][i] - meta["preBalances"][i]) / LAMPORTS_PER_SOL
+    native = (meta["postBalances"][i] - meta["preBalances"][i]) / LAMPORTS_PER_SOL
     if i == 0:
-        sol_delta += meta.get("fee", 0) / LAMPORTS_PER_SOL
+        native += meta.get("fee", 0) / LAMPORTS_PER_SOL
+    sol_delta = native
 
     pre = _token_amounts(meta.get("preTokenBalances"), wallet)
     post = _token_amounts(meta.get("postTokenBalances"), wallet)
@@ -123,12 +137,16 @@ def analyze_wallet_tx(tx: dict | None, wallet: str, signature: str) -> TxView:
 
     # Rent for the wallet's token accounts created or closed in this tx is not
     # part of the trade.
+    # Only rent the wallet itself paid or got back counts: spam senders often
+    # pay to create the token account they drop tokens into.
     pre_accts = _owned_accounts(meta.get("preTokenBalances"), wallet)
     post_accts = _owned_accounts(meta.get("postTokenBalances"), wallet)
-    for idx in post_accts - pre_accts:  # created: rent now sits in the account
-        sol_delta += meta["postBalances"][idx] / LAMPORTS_PER_SOL
-    for idx in pre_accts - post_accts:  # closed: rent refunded to the wallet
-        sol_delta -= meta["preBalances"][idx] / LAMPORTS_PER_SOL
+    created = sum(meta["postBalances"][idx] for idx in post_accts - pre_accts) / LAMPORTS_PER_SOL
+    closed = sum(meta["preBalances"][idx] for idx in pre_accts - post_accts) / LAMPORTS_PER_SOL
+    if created and native <= -created + 1e-9:  # the wallet paid to open its token account
+        sol_delta += created
+    if closed and native >= closed - 1e-9:  # the refund from closing it came back to the wallet
+        sol_delta -= closed
 
     deltas = {m: post.get(m, 0.0) - pre.get(m, 0.0) for m in set(pre) | set(post)}
     deltas = {m: d for m, d in deltas.items() if abs(d) > 0}
@@ -278,4 +296,5 @@ async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500
             failed.pop(s)
         failed.update(await read(transient, show_progress=False))
     res.unreadable = Counter(_reason(e) for e in failed.values())
+    drop_unrelated_transfers(res)
     return res

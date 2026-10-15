@@ -44,6 +44,7 @@ class Position:
     closed_by_transfer: bool = False
     peak_tokens: float = 0.0
     rounds: int = 1
+    traded: bool = False  # ever bought or sold (positions that were only received are not trading)
     signatures: list[str] = field(default_factory=list)
 
     # -- mutation -----------------------------------------------------------
@@ -68,6 +69,8 @@ class Position:
         self.last_ts = t.ts
         self.signatures.append(t.signature)
 
+        if t.side.is_trade:
+            self.traded = True
         if t.side is Side.BUY:
             self.tokens += t.token_amount
             self.basis_tokens += t.token_amount

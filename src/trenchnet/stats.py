@@ -100,7 +100,8 @@ def compute_wallet_stats(wallet: str, trades: Iterable[Trade], now: float | None
     s.active_days = max((s.last_ts - s.first_ts) / 86400.0, 1 / 24)
     s.trades_per_day = s.n_trades / s.active_days
 
-    positions = list(ledger.for_wallet(wallet).values())
+    # Tokens the wallet only received (spam airdrops, gifts) are not trading positions.
+    positions = [p for p in ledger.for_wallet(wallet).values() if p.traded]
     s.n_tokens = len(positions)
 
     holds: list[float] = []
@@ -182,6 +183,10 @@ def select(stats: WalletStats, c: SelectionCriteria) -> Selection:
     observed candidate group, not a ranking of every wallet on Solana."""
     reasons: list[str] = []
     ok = True
+    if stats.n_buys == 0 and stats.n_sells == 0:
+        what = f"only {stats.n_transfers} token transfers" if stats.n_transfers else "no token activity"
+        return Selection(wallet=stats.wallet, eligible=False, score=0.0, reasons=[
+            f"no buys or sells in the downloaded history ({what}): inactive, a bot, or it trades from another wallet"])
     if stats.closed_positions < c.min_closed_positions:
         ok = False
         reasons.append(f"only {stats.closed_positions} closed positions (< {c.min_closed_positions}): "
