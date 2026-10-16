@@ -168,3 +168,37 @@ def test_fomo_prints_the_wallets_if_the_file_cant_be_written(tmp_path, monkeypat
         _fomo_cli(tmp_path, monkeypatch, txs, "--out", str(tmp_path))  # a folder, like a file open in Excel
     assert "Could not update" in str(e.value)
     assert f"{whale},fomo-{whale[:4]}" in capsys.readouterr().out
+
+
+def test_repeated_merges_into_a_windows_file_keep_one_line_ending(tmp_path, monkeypatch):
+    import pathlib
+
+    from trenchnet.cli import _read_wallets
+    from trenchnet.fomo import Trader
+
+    real_write = pathlib.Path.write_text
+    monkeypatch.setattr(pathlib.Path, "write_text",  # what text mode does on Windows
+                        lambda self, data, encoding=None, errors=None, newline=None:
+                        real_write(self, data, encoding=encoding, errors=errors, newline="\r\n"))
+    a, b, c = (str(Pubkey.new_unique()) for _ in range(3))
+    out = tmp_path / "w.txt"
+    out.write_bytes(f"{a},mine\r\n".encode())
+    merge_wallet_file(str(out), [Trader(b)], lambda t: "x")
+    merge_wallet_file(str(out), [Trader(c)], lambda t: "x")
+    data = out.read_bytes()
+    assert b"\r\r" not in data and data.count(b"\r\n") == 3
+    assert _read_wallets(str(out))[0] == [a, b, c]
+
+
+def test_fomo_listing_failure_gives_fomo_advice(tmp_path, monkeypatch):
+    import trenchnet.cli as cli
+    from trenchnet.solana_rpc import RpcHTTPError
+
+    class Down(FakeRpc):
+        async def get_signatures(self, address, limit=1000, before=None):
+            raise RpcHTTPError(429, "max usage reached", kind="quota")
+
+    monkeypatch.setattr(cli, "_rpc_from", lambda url, rps=None: Down({}, {}))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["fomo", "--rpc", "https://x/", "--db", str(tmp_path / "t.db")])
+    assert "trenchnet fomo" in str(e.value) and "saved" not in str(e.value)

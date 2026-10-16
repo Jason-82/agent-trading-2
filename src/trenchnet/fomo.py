@@ -228,6 +228,6 @@ def merge_wallet_file(path: str, traders: list[Trader], note: Callable[[Trader],
     new = [t for t in traders if t.wallet not in have]
     if new:
         lines = [f"{t.wallet},fomo-{t.wallet[:4]}  # {note(t)}" for t in new]
-        sep = "" if not existing or existing.endswith(("\n", "\r")) else "\n"
+        sep = "" if not existing or existing.endswith("\n") else "\n"
         p.write_text(existing + sep + "\n".join(lines) + "\n", encoding="utf-8")
     return len(new), len(traders) - len(new)

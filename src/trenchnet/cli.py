@@ -235,6 +235,10 @@ _FOMO_STOP_ADVICE = {
 }
 
 
+def _fomo_advice(kind: str) -> str:
+    return _FOMO_STOP_ADVICE.get(kind) or _STOP_ADVICE.get(kind, "")
+
+
 def _rpc_from(url: str, rps: float | None = None):
     from .solana_rpc import SolanaRpc
 
@@ -276,7 +280,7 @@ async def cmd_backfill(args, cfg: Config) -> None:
         # The transactions read this time replace what was saved for them before (an older
         # reader may have read them differently); older history and live trades are kept.
         nonlocal total_new, total_fixed, unpriced
-        new, fixed = store.replace_trades(w, res.trades, res.read)
+        new, fixed = store.replace_trades(w, res.trades, res.read, order=res.order)
         total_new += new
         total_fixed += fixed
         unpriced += res.unpriced
@@ -478,7 +482,7 @@ async def cmd_fomo(args, cfg: Config) -> None:
                                progress=lambda d, t, n: PROGRESS.show(f"{d}/{t} transactions read, {n} traders found"))
     except (RpcHTTPError, RpcError) as e:
         PROGRESS.end()
-        advice = _STOP_ADVICE.get(e.kind, "") if isinstance(e, RpcHTTPError) else ""
+        advice = _fomo_advice(e.kind) if isinstance(e, RpcHTTPError) else ""
         sys.exit(f"Could not list Fomo's transactions: {e}\n{advice}".rstrip())
     finally:
         PROGRESS.end()
@@ -497,7 +501,7 @@ async def cmd_fomo(args, cfg: Config) -> None:
         # The RPC is the problem, not Fomo's addresses.
         why = str(found.stopped) if found.stopped is not None else f"none of them could be read ({unreadable})"
         kind = found.stopped.kind if found.stopped is not None else "transient"
-        advice = _FOMO_STOP_ADVICE.get(kind) or _STOP_ADVICE.get(kind, "")
+        advice = _fomo_advice(kind)
         if not found.traders:
             sys.exit(f"Could not read Fomo's transactions: {why}\n{advice}")
         print(f"Stopped early: {why}\nOnly {found.read} of the {found.sampled} sampled transactions were read, so "

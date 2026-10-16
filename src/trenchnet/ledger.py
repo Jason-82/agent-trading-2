@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import Iterable
 
 from .models import Side, Trade
 
@@ -212,6 +213,17 @@ class Ledger:
             self._by_wallet[t.wallet][t.mint] = pos
             self._by_mint[t.mint][t.wallet] = pos
         pos.apply(t)
+        return pos
+
+    def rebuild(self, wallet: str, mint: str, trades: Iterable[Trade]) -> Position:
+        """Replace one position by replaying its trades in time order (used
+        when a trade arrives after a later one was already applied)."""
+        pos = Position(wallet=wallet, mint=mint)
+        for t in sorted((t for t in trades if t.wallet == wallet and t.mint == mint), key=lambda t: t.ts):
+            pos.apply(t)
+        self._positions[(wallet, mint)] = pos
+        self._by_wallet[wallet][mint] = pos
+        self._by_mint[mint][wallet] = pos
         return pos
 
     def get(self, wallet: str, mint: str) -> Position | None:

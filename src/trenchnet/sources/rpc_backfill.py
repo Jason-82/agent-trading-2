@@ -289,6 +289,7 @@ class BackfillResult:
     # Signatures whose reading is final (trade or no trade): saved trades for exactly these are replaced.
     read: set[str] = field(default_factory=set)
     held_back: int = 0  # trades not saved yet: an unread transaction from the same second could precede them
+    order: dict[str, int] = field(default_factory=dict)  # every listed signature -> position on chain (higher = later)
     unpriced: int = 0  # stablecoin-priced trades left out for lack of a SOL/USD price
 
 
@@ -393,6 +394,7 @@ async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500
     sigs = [s["signature"] for s in listed]
     block_time = {s["signature"]: s.get("blockTime") for s in listed}
     newest_first = {s: i for i, s in enumerate(sigs)}
+    res.order = {s: len(sigs) - i for i, s in enumerate(sigs)}
     pending: list[TxView] = []  # stablecoin-priced, waiting for a SOL/USD price
     warned: set[str] = set()
 

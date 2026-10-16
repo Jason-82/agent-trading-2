@@ -280,8 +280,9 @@ def test_replace_trades_only_touches_the_signatures_read():
                                           Trade("fresh", W, COIN, Side.BUY, 0.1, 10, 7, source="rpc")],
                                       {"reread", "gone", "fresh"})
     rows = sorted((t.signature, t.side.value, t.source) for t in store.trades())
-    # The live row with the same key stays; the misread transfer and the spam row are gone.
-    assert rows == [("fresh", "buy", "rpc"), ("older", "buy", "rpc"), ("reread", "sell", "pumpportal:pump")]
+    # The live copy of the same trade is stored again from the chain reading; the misread transfer
+    # and the spam row are gone; older history stays.
+    assert rows == [("fresh", "buy", "rpc"), ("older", "buy", "rpc"), ("reread", "sell", "rpc")]
     assert (new, fixed) == (1, 2)
 
 
@@ -549,3 +550,73 @@ async def test_live_trade_is_priced_when_the_pc_clock_is_behind():
     prices = SolUsdPrices(sources=[PriceSource("a", 300, fetch)], now=lambda: trade_ts - 20)  # PC 20 s behind
     assert await prices.price_at(trade_ts) == 150.0
     assert asked and asked[0][1] >= trade_ts // BUCKET_S * BUCKET_S
+
+
+# -- review round 5 ----------------------------------------------------------------
+
+def _t(sig, side, mint=COIN, sol=0.5, src="rpc"):
+    return Trade(sig, W, mint, Side(side), sol, 1000, T0, source=src)
+
+
+@pytest.mark.parametrize("chain,stored,read,expected", [
+    # chain order (earliest first) | stored rows, in rowid order | read now (signature -> trade or None) | result
+    (["u", "s1", "s0"], ["u", "s0"], {"s1": "buy", "s0": "sell", "u": None}, ["u", "s1", "s0"]),
+    (["u", "s1", "s0"], ["u", "s0", "s1"], {"s1": "buy", "s0": "sell", "u": None}, ["u", "s1", "s0"]),  # old reversed
+    (["a", "b", "c"], ["b", "c"], {"a": "buy", "b": "buy", "c": None}, ["a", "b", "c"]),  # new earlier key
+    (["b", "a", "c"], ["b", "c"], {"a": "buy", "b": "buy", "c": None}, ["b", "a", "c"]),  # new key in between
+])
+def test_a_touched_second_is_saved_in_chain_order(chain, stored, read, expected):
+    sides = {"u": "buy", "s1": "buy", "s0": "sell", "a": "buy", "b": "buy", "c": "sell"}
+    mints = {"u": "Other", "a": "Other"}
+    store = Store()
+    store.add_trades([_t(s, sides[s], mints.get(s, COIN)) for s in stored])
+    order = {s: i for i, s in enumerate(chain)}  # higher = later
+    trades = [_t(s, read[s], mints.get(s, COIN)) for s in chain if read.get(s)]
+    store.replace_trades(W, trades, {s for s, v in read.items() if v}, order=order)
+    assert [t.signature for t in store.trades()] == expected
+
+
+def test_two_reruns_with_different_unreadable_neighbours_keep_the_pair_in_order(monkeypatch, tmp_path):
+    good = {
+        "s0": tx(-FEE + 600_000_000 + RENT, {COIN: 1000}, {}, programs=[PUMP]),  # sell (latest)
+        "s1": tx(-FEE - 500_000_000 - RENT, {}, {COIN: 1000}, programs=[PUMP]),  # buy
+        "u": tx(-FEE - 300_000_000 - RENT, {}, {"Other": 5}, programs=[PUMP]),  # another coin (earliest)
+    }
+    gone = RpcError(-32009, "missing in long-term storage")
+    _run_backfill(monkeypatch, tmp_path, FakeRpc({W: listing("s0", "s1", "u")}, {**good, "s1": gone}))
+    _run_backfill(monkeypatch, tmp_path, FakeRpc({W: listing("s0", "s1", "u")}, {**good, "u": gone}))
+    trades = Store(tmp_path / "t.db").trades()
+    assert [t.signature for t in trades] == ["u", "s1", "s0"]
+    assert compute_wallet_stats(W, trades).realized_pnl_sol == pytest.approx(0.1)
+
+
+async def test_overlapping_lookups_ride_out_a_blip_together():
+    down = True
+
+    async def fetch(http, start, end):
+        if down:
+            raise httpx.ConnectError("getaddrinfo failed")
+        return [(b, 150.0) for b in range(start, end + 1, BUCKET_S)]
+    prices = SolUsdPrices(sources=[PriceSource("a", 300, fetch), PriceSource("b", 300, fetch)],
+                          now=lambda: T0 + 3600, retry_pause_s=0.2)
+    first = asyncio.create_task(prices.price_at(T0 + 3590))
+    await asyncio.sleep(0.05)  # the first lookup is pausing between rounds
+    second = asyncio.create_task(prices.price_at(T0 + 3595))
+    await asyncio.sleep(0.05)
+    down = False  # back before the pause ends
+    assert await first == 150.0 and await second == 150.0
+    assert prices._until == {} and prices.problem is None
+
+
+async def test_lookups_while_every_source_rests_return_at_once():
+    clock = Clock()
+    fetch, calls = _flaky(["down"] * 4)
+    prices = SolUsdPrices(sources=[PriceSource("a", 300, fetch)], now=lambda: T0 + 86400, monotonic=clock,
+                          retry_pause_s=5.0)
+    loop = asyncio.get_running_loop()
+    prices.retry_pause_s = 0
+    assert await prices.price_at(T0) is None  # two failures: resting
+    prices.retry_pause_s = 5.0
+    started = loop.time()
+    assert await prices.price_at(T0) is None
+    assert loop.time() - started < 0.5 and len(calls) == 2

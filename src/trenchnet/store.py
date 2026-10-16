@@ -139,51 +139,61 @@ class Store:
         return cur.rowcount
 
     def replace_trades(self, wallet: str, trades: Iterable[Trade], signatures: Iterable[str],
-                       source: str = "rpc") -> tuple[int, int]:
-        """Save a fresh reading of some of a wallet's transactions. Stored rows
-        from `source` for those signatures are replaced by `trades`, all in one
-        database transaction; rows for other signatures (older history, trades
-        seen live) are untouched.
+                       source: str = "rpc", order: dict[str, int] | None = None) -> tuple[int, int]:
+        """Save a fresh reading of some of a wallet's transactions, in one
+        database transaction. It replaces this source's earlier reading of
+        those signatures, and any copy of the same trade from another source
+        (a trade seen live is stored again with its on-chain time). Other rows
+        (older history, other trades seen live) are kept.
 
-        Trades in the same second replay in the order they were saved, so a
-        second is only rewritten in chain order when this reading covers every
-        row stored for it. Where it doesn't (a neighbour couldn't be read this
-        time, or was seen live), rows that read the same are updated where they
-        are instead of being moved behind their neighbours.
+        Trades in the same second replay in the order they are stored, so every
+        second this touches is rewritten in on-chain order: `order` gives each
+        listed signature's position on chain (higher = later), whether or not
+        it could be read this time; rows of signatures it doesn't list come
+        from before the listed window and go first, as they were. Without
+        `order`, `trades` are taken to be in chain order.
 
         Returns (rows that weren't stored before, old rows that are gone because
         the transaction now reads differently)."""
         trades = list(trades)
-        sigs = sorted(set(signatures) | {t.signature for t in trades})
-        sig_set = set(sigs)
-        new_keys = {t.key for t in trades}
+        read = set(signatures) | {t.signature for t in trades}
+        new_by_key = {t.key: t for t in trades}
+        pos = dict(order) if order is not None else {}
+        if order is None:
+            for i, t in enumerate(trades):
+                pos.setdefault(t.signature, i)
+
+        def chain(t: Trade) -> tuple[int, int]:
+            return (1, pos[t.signature]) if t.signature in pos else (0, 0)
+
         with self.db:
-            rows: list[sqlite3.Row] = []
+            old: list[Trade] = []
+            sigs = sorted(read)
             for i in range(0, len(sigs), 500):  # stay under SQLite's limit on query parameters
                 chunk = sigs[i:i + 500]
-                rows += self.db.execute(
-                    f"SELECT signature, wallet, mint, side, ts FROM trades WHERE wallet = ? AND source = ?"
-                    f" AND signature IN ({','.join('?' * len(chunk))})", [wallet, source, *chunk]).fetchall()
-            old = {tuple(r)[:4] for r in rows}
-            partial: set[float] = set()
-            for ts in {r["ts"] for r in rows} | {t.ts for t in trades}:
-                for r in self.db.execute("SELECT signature, source FROM trades WHERE wallet = ? AND ts = ?",
-                                         (wallet, ts)):
-                    if r["source"] != source or r["signature"] not in sig_set:
-                        partial.add(ts)
-                        break
-            keep = {tuple(r)[:4] for r in rows if r["ts"] in partial} & new_keys
-            self.db.executemany(
-                "DELETE FROM trades WHERE signature = ? AND wallet = ? AND mint = ? AND side = ? AND source = ?",
-                [(*k, source) for k in old - keep])
-            self.db.executemany(
-                "UPDATE trades SET sol_amount = ?, token_amount = ?, ts = ?, market_cap_sol = ?, price_sol = ?,"
-                " quote_mint = ?, quote_amount = ? WHERE signature = ? AND wallet = ? AND mint = ? AND side = ?"
-                " AND source = ?",
-                [(t.sol_amount, t.token_amount, t.ts, t.market_cap_sol, t.price_sol, t.quote_mint, t.quote_amount,
-                  *t.key, source) for t in trades if t.key in keep])
-            inserted = self.db.executemany(self._INSERT, [self._row(t) for t in trades if t.key not in keep]).rowcount
-        return inserted - len((old - keep) & new_keys), len(old - new_keys)
+                old += [self._row_to_trade(r) for r in self.db.execute(
+                    f"SELECT * FROM trades WHERE wallet = ? AND signature IN ({','.join('?' * len(chunk))})",
+                    [wallet, *chunk])]
+
+            def replaced(t: Trade) -> bool:
+                return (t.source == source and t.signature in read) or t.key in new_by_key
+
+            ours = {t.key for t in old if t.source == source}
+            touched = {t.ts for t in old if replaced(t)} | {t.ts for t in trades}
+            seconds: list[list[Trade]] = []
+            for ts in sorted(touched):
+                here = [self._row_to_trade(r) for r in self.db.execute(
+                    "SELECT * FROM trades WHERE wallet = ? AND ts = ? ORDER BY rowid", (wallet, ts))]
+                rows = [t for t in here if not replaced(t)] + [t for t in trades if t.ts == ts]
+                rows.sort(key=chain)  # stable: rows from before the window keep their stored order
+                seconds.append(rows)
+                self.db.execute("DELETE FROM trades WHERE wallet = ? AND ts = ?", (wallet, ts))
+            # Insert only after every touched second is cleared: a replaced copy can sit in another
+            # second (a live copy stamped with this PC's clock) and would block the insert.
+            for rows in seconds:
+                self.db.executemany(self._INSERT, [self._row(t) for t in rows])
+        before = {t.key for t in old}
+        return len(set(new_by_key) - before), len(ours - set(new_by_key))
 
     def traded_mints(self, wallet: str) -> set[str]:
         """Tokens the wallet bought or sold in the stored history."""

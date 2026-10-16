@@ -123,6 +123,7 @@ class SolUsdPrices:
         self._fails: dict[str, int] = {}  # failures in a row, per source
         self._until: dict[str, float] = {}  # source resting until this monotonic time (inf: not this run)
         self._why: dict[str, str] = {}  # last failure, per source
+        self._lock: asyncio.Lock | None = None  # one download at a time (live trades look prices up in parallel)
         self.problem: str | None = None  # why prices are missing, for the user
 
     @property
@@ -171,6 +172,16 @@ class SolUsdPrices:
         if not need:
             return
         self._load(need[0] - NEAREST_S, need[-1] + NEAREST_S)
+        if all(b in self._cache or b in self._asked for b in need):
+            return
+        # Lookups made while another is downloading (or pausing between rounds) wait for it, then
+        # usually find their candle cached; failures are counted once per outage, not per lookup.
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            await self._prefetch(need)
+
+    async def _prefetch(self, need: list[int]) -> None:
         now = max(bucket(self.now()), need[-1])  # a block's time can be ahead of this PC's clock
         missing = [b for b in need if b not in self._cache and b not in self._asked and b <= now]
         while missing:
@@ -210,8 +221,9 @@ class SolUsdPrices:
                 settled = bucket(self.now() - SETTLED_S)
                 self._asked.update(b for b in range(start, end + 1, BUCKET_S) if b <= settled)
                 return end
-            resting = [s for s in self.sources if self._until.get(s.name, 0.0) < math.inf]
-            if round_ == 0 and resting:
+            if round_ == 0:
+                if not self._usable():  # every source is resting or refused: nothing to wait for
+                    return None
                 await asyncio.sleep(self.retry_pause_s)
         return None
 
