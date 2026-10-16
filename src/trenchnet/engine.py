@@ -122,10 +122,10 @@ class Engine:
             return
         self.seen.add(t.key)
         self.store.add_trade(t)
-        if t.price is not None:
-            self.prices[t.mint] = t.price
+        case = self.cases.get(t.mint)
+        if t.price is not None and (case is None or case.last_price_ts is None or t.ts >= case.last_price_ts):
+            self.prices[t.mint] = t.price  # never older than the price already seen for the token
         if t.wallet not in self.tracked_set:
-            case = self.cases.get(t.mint)
             if case is not None:
                 case.update_price(t.price, t.ts, t.market_cap_sol)
                 await self._exits(case)
@@ -133,7 +133,6 @@ class Engine:
 
         self.ledger.apply(t)
         self.graph.add_trade(t)
-        case = self.cases.get(t.mint)
         if case is None:
             case = self.cases[t.mint] = Case(mint=t.mint, opened_ts=t.ts)
         case.add_event(t)

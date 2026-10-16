@@ -72,3 +72,14 @@ async def test_first_entry_is_the_earliest_buy_even_if_it_arrives_later():
     await e.handle(rpc("b1", "buy", T0 + 2))  # e.g. a replay file out of order
     assert e.cases[COIN].first_entry_ts == T0 + 2
     assert e.strategy.cohort(e.cases[COIN], e.ledger, e.tracked_set) == [W, W2]
+
+
+async def test_a_late_trade_does_not_replace_a_newer_price():
+    from trenchnet.models import PriceTick
+
+    e = engine()
+    await e.handle(pp("b0", "buy", T0, wallet=W2))  # opens the case
+    await e.handle(PriceTick(COIN, 1.05e-6, T0 + 2))  # live price update
+    late = Trade("fomo1", W, COIN, Side.BUY, 0.00062, 1000, T0 + 1, source="rpc")  # announced at +1, read at +3
+    await e.handle(late)
+    assert e.cases[COIN].last_price == pytest.approx(1.05e-6) and e.prices[COIN] == pytest.approx(1.05e-6)

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 
 import websockets
 from solders.pubkey import Pubkey
@@ -251,3 +252,23 @@ def test_first_ctrl_c_drops_events_that_are_waiting(tmp_path, monkeypatch):
 
     asyncio.run(main())
     assert len(handled) == 1
+
+
+async def test_a_slow_read_keeps_the_time_it_was_announced():
+    loop_times = {}
+
+    async def handler(ws):
+        await _ack_all(ws, 1)
+        loop_times["sent"] = time.time()
+        await ws.send(_note(100, "slow"))
+        await ws.wait_closed()
+
+    rpc = FakeRpc({}, {"slow": [None, tx(-FEE - 500_000_000 - RENT, {}, {COIN: 1000}, programs=[PUMP])]})
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        src = RpcWalletSource(rpc, [W], ws_url=f"ws://127.0.0.1:{port}", fetch_pause_s=0.5)
+        async for ev in src.events():
+            got_at = time.time()
+            src.stop()
+    assert got_at - ev.ts >= 0.4  # stamped when announced, not when the read finally succeeded
+    assert ev.ts - loop_times["sent"] < 0.3

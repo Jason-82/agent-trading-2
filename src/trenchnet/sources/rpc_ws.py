@@ -159,7 +159,7 @@ class RpcWalletSource:
                 self._seen.popitem(last=False)
             # Reads run in parallel, but each wallet's trades are reported in the order they were
             # notified: a sell that reads faster than the buy before it must not overtake it.
-            task = asyncio.create_task(self._read(sig, wallet, queue, self._last.get(wallet)))
+            task = asyncio.create_task(self._read(sig, wallet, queue, self._last.get(wallet), time.time()))
             self._last[wallet] = task
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -167,7 +167,8 @@ class RpcWalletSource:
             if self._stop:
                 return
 
-    async def _read(self, sig: str, wallet: str, queue: asyncio.Queue, previous: asyncio.Task | None) -> None:
+    async def _read(self, sig: str, wallet: str, queue: asyncio.Queue, previous: asyncio.Task | None,
+                    notified: float) -> None:
         trade = None
         try:
             trade = await self._read_one(sig, wallet)
@@ -177,10 +178,11 @@ class RpcWalletSource:
             if previous is not None:  # wait for the wallet's earlier read however it ends
                 await asyncio.wait([previous])
         if trade is not None and trade.side.is_trade:  # like PumpPortal: buys and sells only
-            # Stamped with this PC's clock when it reaches the bot, as PumpPortal does, so the bot
-            # sees one clock and applies trades in the order they arrive (each wallet's in chain
-            # order, above). A later backfill stores it with its on-chain time.
-            await queue.put(replace(trade, ts=time.time()))
+            # Stamped with this PC's clock when the RPC announced it, as PumpPortal stamps its
+            # trades on arrival, so the bot sees one clock (each wallet's trades stay in chain
+            # order, above). Not when the read finished: a read can take seconds, and its price
+            # must not override newer price updates. A later backfill stores the on-chain time.
+            await queue.put(replace(trade, ts=notified))
 
     async def _read_one(self, sig: str, wallet: str) -> Trade | None:
         tx = None
