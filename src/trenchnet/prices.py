@@ -124,6 +124,8 @@ class SolUsdPrices:
         self._until: dict[str, float] = {}  # source resting until this monotonic time (inf: not this run)
         self._why: dict[str, str] = {}  # last failure, per source
         self._lock: asyncio.Lock | None = None  # one download at a time (live trades look prices up in parallel)
+        self._windows = 0  # windows downloaded so far
+        self._recent: dict[int, int] = {}  # recent bucket -> number of the last window that covered it
         self.problem: str | None = None  # why prices are missing, for the user
 
     @property
@@ -175,15 +177,18 @@ class SolUsdPrices:
         if all(b in self._cache or b in self._asked for b in need):
             return
         # Lookups made while another is downloading (or pausing between rounds) wait for it, then
-        # usually find their candle cached; failures are counted once per outage, not per lookup.
+        # use what it fetched: failures are counted once per outage, and a candle the exchange
+        # hasn't published yet is asked for once, not once per waiting lookup.
         if self._lock is None:
             self._lock = asyncio.Lock()
+        seen = self._windows
         async with self._lock:
-            await self._prefetch(need)
+            await self._prefetch(need, seen)
 
-    async def _prefetch(self, need: list[int]) -> None:
+    async def _prefetch(self, need: list[int], seen: int) -> None:
         now = max(bucket(self.now()), need[-1])  # a block's time can be ahead of this PC's clock
-        missing = [b for b in need if b not in self._cache and b not in self._asked and b <= now]
+        missing = [b for b in need if b not in self._cache and b not in self._asked and b <= now
+                   and self._recent.get(b, 0) <= seen]  # not covered by a download that ended while waiting
         while missing:
             start = missing[0]
             if start > bucket(self.now() - SETTLED_S):
@@ -220,6 +225,9 @@ class SolUsdPrices:
                     self.store.save_sol_usd(got)
                 settled = bucket(self.now() - SETTLED_S)
                 self._asked.update(b for b in range(start, end + 1, BUCKET_S) if b <= settled)
+                self._windows += 1
+                self._recent = {b: n for b, n in self._recent.items() if b > settled}
+                self._recent.update((b, self._windows) for b in range(max(start, settled + BUCKET_S), end + 1, BUCKET_S))
                 return end
             if round_ == 0:
                 if not self._usable():  # every source is resting or refused: nothing to wait for

@@ -59,7 +59,9 @@ async def test_reports_the_wallets_buys_and_sells():
                 src.stop()
     assert subscribed == [W]
     assert [(t.signature, t.side, round(t.sol_amount, 6)) for t in got] == [
-        ("solBuy", Side.BUY, 0.5), ("usdcSell", Side.SELL, 2.0)]
+        ("solBuy", Side.BUY, 0.5), ("usdcSell", Side.SELL, 2.0)]  # valued at the price of its block time
+    # Stamped when they reach the bot (one clock with PumpPortal), not with the block time.
+    assert all(t.ts > T0 + 86400 for t in got) and got[0].ts <= got[1].ts
 
 
 async def test_a_wallets_trades_come_out_in_chain_order_even_when_reads_finish_out_of_order():

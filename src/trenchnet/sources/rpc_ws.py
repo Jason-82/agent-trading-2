@@ -16,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections import OrderedDict
+from dataclasses import replace
 from typing import TYPE_CHECKING, AsyncIterator, Iterable
 from urllib.parse import urlparse
 
@@ -175,7 +177,10 @@ class RpcWalletSource:
             if previous is not None:  # wait for the wallet's earlier read however it ends
                 await asyncio.wait([previous])
         if trade is not None and trade.side.is_trade:  # like PumpPortal: buys and sells only
-            await queue.put(trade)
+            # Stamped with this PC's clock when it reaches the bot, as PumpPortal does, so the bot
+            # sees one clock and applies trades in the order they arrive (each wallet's in chain
+            # order, above). A later backfill stores it with its on-chain time.
+            await queue.put(replace(trade, ts=time.time()))
 
     async def _read_one(self, sig: str, wallet: str) -> Trade | None:
         tx = None

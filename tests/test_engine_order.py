@@ -1,4 +1,6 @@
-"""Live trades of one wallet arriving out of order from two sources."""
+"""Live trades from two sources (PumpPortal and the RPC watcher): the bot
+uses one clock, the time each trade reaches it, and applies trades in the
+order they arrive."""
 
 import pytest
 
@@ -10,7 +12,7 @@ from trenchnet.models import Side, Trade
 from trenchnet.reporter import Reporter
 from trenchnet.store import Store
 
-W, COIN, T0 = "WalletA", "CoinX", 1_760_000_000.0
+W, W2, COIN, T0 = "WalletA", "WalletB", "CoinX", 1_760_000_000.0
 
 
 def engine():
@@ -18,41 +20,55 @@ def engine():
     cfg.llm.use_llm_profiles = cfg.llm.use_llm_judge = cfg.llm.use_llm_reports = False
     cfg.strategy.enabled = False
     store = Store()
-    store.upsert_roster(wallet=W, alias="A", included=True, score=1.0, reasons=[], stats={}, profile=None,
-                        profile_source=None, ts=0)
+    for w in (W, W2):
+        store.upsert_roster(wallet=w, alias=w[-1], included=True, score=1.0, reasons=[], stats={}, profile=None,
+                            profile_source=None, ts=0)
     return Engine(cfg, store, tracked_from_roster(store.roster()), HeuristicJudge(cfg), Reporter(cfg),
                   PaperBroker(cfg.paper), out=lambda line: None)
 
 
-@pytest.mark.parametrize("clock_error", [0.0, -3.0, 3.0])  # this PC's clock vs the chain
-async def test_sell_reported_first_by_pumpportal_still_follows_the_rpc_buy(clock_error):
+def pp(sig, side, at, wallet=W):
+    return Trade(sig, wallet, COIN, Side(side), 0.5 if side == "buy" else 0.6, 1000, at, source="pumpportal:pump")
+
+
+def rpc(sig, side, at, wallet=W):
+    return Trade(sig, wallet, COIN, Side(side), 0.5 if side == "buy" else 0.6, 1000, at, source="rpc")
+
+
+async def test_the_rpc_copy_of_a_trade_pumpportal_reported_changes_nothing():
     e = engine()
-    pp_sell = Trade("sell1", W, COIN, Side.SELL, 0.6, 1000, T0 + 1 + 0.8 + clock_error, source="pumpportal:pump")
-    rpc_buy = Trade("buy1", W, COIN, Side.BUY, 0.5, 1000, T0, source="rpc")  # only the RPC saw it (aggregator)
-    rpc_sell = Trade("sell1", W, COIN, Side.SELL, 0.6, 1000, T0 + 1, source="rpc")  # chain copy of the sell
-    await e.handle(pp_sell)
-    await e.handle(rpc_buy)
-    if clock_error >= 0:  # the buy is visibly older than the sell: put in order at once
-        assert e.ledger.get(W, COIN).status == "exited"
-    await e.handle(rpc_sell)  # the chain copy settles every case
+    await e.handle(pp("buy1", "buy", T0 + 0.6))
+    await e.handle(rpc("buy1", "buy", T0 + 1.4))  # the same trade, a moment later through the RPC
+    case = e.cases[COIN]
+    assert case.first_entry_ts == T0 + 0.6 and len(case.events) == 1
+    assert e.strategy.cohort(case, e.ledger, e.tracked_set) == [W]  # the first buyer stays in the cohort
+    assert len(e.store.trades(wallets=[W])) == 1
+
+
+@pytest.mark.parametrize("arrivals", [
+    # (source, signature, side, arrival) - a quick buy then sell; the buy's RPC read is lost
+    [("pp", "buy1", "buy", 0.9), ("pp", "sell1", "sell", 1.3), ("rpc", "sell1", "sell", 2.0)],
+    [("pp", "buy1", "buy", 0.9), ("rpc", "sell1", "sell", 1.2), ("pp", "sell1", "sell", 1.3)],
+    # PC clock wrong: arrival order still decides
+    [("pp", "buy1", "buy", 5.0), ("rpc", "buy1", "buy", 5.5), ("pp", "sell1", "sell", 6.0)],
+    # Fomo/aggregator buy only the RPC sees, then a pump.fun sell PumpPortal reports
+    [("rpc", "buy1", "buy", 1.5), ("pp", "sell1", "sell", 3.0), ("rpc", "sell1", "sell", 3.6)],
+])
+async def test_trades_are_applied_in_the_order_they_arrive(arrivals):
+    e = engine()
+    for src, sig, side, at in arrivals:
+        await e.handle((pp if src == "pp" else rpc)(sig, side, T0 + at))
     pos = e.ledger.get(W, COIN)
     assert pos.status == "exited" and pos.realized_pnl_sol == pytest.approx(0.1)
-    stored = e.store.trades(wallets=[W])
-    assert [(t.signature, t.ts, t.source) for t in stored] == [("buy1", T0, "rpc"), ("sell1", T0 + 1, "rpc")]
+    # A restart replays the stored history the same way.
+    restarted = Engine(e.cfg, e.store, e.tracked, e.judge, e.reporter, e.broker,
+                       history=e.store.trades(wallets=[W]), out=lambda line: None)
+    assert restarted.ledger.get(W, COIN).status == "exited"
 
 
-async def test_buy_reported_first_by_pumpportal_with_a_fast_clock_settles_in_chain_order():
+async def test_first_entry_is_the_earliest_buy_even_if_it_arrives_later():
     e = engine()
-    for ev in (Trade("buy1", W, COIN, Side.BUY, 0.5, 1000, T0 + 21, source="pumpportal:pump"),  # clock 20 s ahead
-               Trade("buy1", W, COIN, Side.BUY, 0.5, 1000, T0, source="rpc"),
-               Trade("sell1", W, COIN, Side.SELL, 0.6, 1000, T0 + 5, source="rpc")):
-        await e.handle(ev)
-    assert e.ledger.get(W, COIN).status == "exited"
-
-
-async def test_in_order_trades_are_applied_without_a_rebuild(monkeypatch):
-    e = engine()
-    monkeypatch.setattr(e.ledger, "rebuild", lambda *a: pytest.fail("rebuilt"))
-    await e.handle(Trade("b", W, COIN, Side.BUY, 0.5, 1000, T0, source="pumpportal:pump"))
-    await e.handle(Trade("s", W, COIN, Side.SELL, 0.6, 1000, T0 + 2, source="pumpportal:pump"))
-    assert e.ledger.get(W, COIN).status == "exited"
+    await e.handle(pp("b2", "buy", T0 + 5, wallet=W2))
+    await e.handle(rpc("b1", "buy", T0 + 2))  # e.g. a replay file out of order
+    assert e.cases[COIN].first_entry_ts == T0 + 2
+    assert e.strategy.cohort(e.cases[COIN], e.ledger, e.tracked_set) == [W, W2]

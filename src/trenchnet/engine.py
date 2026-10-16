@@ -117,27 +117,8 @@ class Engine:
             case.update_price(tick.price_sol, tick.ts, tick.market_cap_sol)
             await self._exits(case)
 
-    def _rebuild(self, t: Trade) -> None:
-        self.ledger.rebuild(t.wallet, t.mint, self.store.trades(wallets=[t.wallet], mint=t.mint, until=self.now))
-
-    async def _confirm(self, t: Trade) -> None:
-        """The on-chain copy (from the RPC watcher) of a trade first reported
-        live by PumpPortal, which stamps trades with this PC's clock: store it
-        with its chain time and replay the position in chain order."""
-        stored = self.store.trades(wallets=[t.wallet], mint=t.mint)
-        old = next((s for s in stored if s.key == t.key), None)
-        if old is None or old.source == t.source or old.ts == t.ts:
-            return
-        self.store.replace_trades(t.wallet, [t], {t.signature}, source=t.source)
-        self._rebuild(t)
-        case = self.cases.get(t.mint)
-        if case is not None:
-            await self._exits(case)
-
     async def on_trade(self, t: Trade) -> None:
         if t.key in self.seen:
-            if t.source == "rpc" and t.wallet in self.tracked_set:
-                await self._confirm(t)
             return
         self.seen.add(t.key)
         self.store.add_trade(t)
@@ -150,14 +131,7 @@ class Engine:
                 await self._exits(case)
             return
 
-        pos = self.ledger.get(t.wallet, t.mint)
-        if pos is not None and pos.last_ts is not None and t.ts < pos.last_ts:
-            # Arrived after a later trade of the same wallet and token (the two live sources
-            # don't wait for each other): replay the position in time order instead.
-            # Two trades in the same second from different sources can't be ordered this way.
-            self._rebuild(t)
-        else:
-            self.ledger.apply(t)
+        self.ledger.apply(t)
         self.graph.add_trade(t)
         case = self.cases.get(t.mint)
         if case is None:

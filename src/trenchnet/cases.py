@@ -65,7 +65,7 @@ class Case:
     def add_event(self, t: Trade) -> None:
         self._index[t.key] = len(self.events)
         self.events.append(t)
-        if t.side is Side.BUY and self.first_entry_ts is None:
+        if t.side is Side.BUY and (self.first_entry_ts is None or t.ts < self.first_entry_ts):
             self.first_entry_ts = t.ts
             self.first_entry_price = t.price
         self.update_price(t.price, t.ts, t.market_cap_sol)

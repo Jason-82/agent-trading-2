@@ -620,3 +620,19 @@ async def test_lookups_while_every_source_rests_return_at_once():
     started = loop.time()
     assert await prices.price_at(T0) is None
     assert loop.time() - started < 0.5 and len(calls) == 2
+
+
+async def test_lookups_that_wait_for_an_unpublished_candle_share_one_request():
+    new = (T0 // BUCKET_S + 1) * BUCKET_S
+    asked = []
+
+    async def fetch(http, start, end):
+        asked.append((start, end))
+        await asyncio.sleep(0.05)
+        return [(b, 150.0) for b in range(start, end + 1, BUCKET_S) if b < new]  # current candle not out yet
+    prices = SolUsdPrices(sources=[PriceSource("a", 300, fetch)], now=lambda: new + 4)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    got = await asyncio.gather(*(prices.price_at(new + 3) for _ in range(6)))
+    assert got == [150.0] * 6 and len(asked) == 1 and loop.time() - started < 0.2
+    assert await prices.price_at(new + 30) == 150.0 and len(asked) == 2  # a later lookup asks again

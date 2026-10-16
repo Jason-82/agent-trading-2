@@ -203,6 +203,12 @@ Use a fresh wallet holding only what you are prepared to lose.
   followed and paper traded; whether PumpPortal can execute a live order on
   a given USDC pair is up to PumpPortal. Price updates for exits come from
   PumpPortal and from the followed wallets' own trades.
+- While running, the bot takes each followed wallet's trades in the order
+  they reach it, from PumpPortal or your RPC, whichever is first. A trade
+  only your RPC sees (a Fomo or aggregator trade) reaches it a second or two
+  later than a pump.fun trade PumpPortal reports, so two trades by the same
+  wallet that close together can be taken in the wrong order until the next
+  backfill, which stores every trade with its on-chain time.
 - The Fomo account addresses `trenchnet fomo` uses come from DefiLlama's
   open-source Fomo adapter. If it stops finding trades, Fomo has probably
   changed them: `trenchnet fomo --account <address>`.
