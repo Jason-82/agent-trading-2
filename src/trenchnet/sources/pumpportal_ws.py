@@ -65,6 +65,7 @@ class PumpPortalSource:
         self._tokens: set[str] = set()
         self._ws = None
         self._stop = False
+        self._stopped = asyncio.Event()
 
     @property
     def url(self) -> str:
@@ -93,6 +94,7 @@ class PumpPortalSource:
 
     def stop(self) -> None:
         self._stop = True
+        self._stopped.set()
         if self._ws is not None:
             asyncio.get_running_loop().create_task(self._ws.close())
 
@@ -125,5 +127,8 @@ class PumpPortalSource:
             finally:
                 self._ws = None
             if not self._stop:
-                await asyncio.sleep(backoff)
+                try:  # a stop() during the wait ends it at once
+                    await asyncio.wait_for(self._stopped.wait(), backoff)
+                except asyncio.TimeoutError:
+                    pass
                 backoff = min(backoff * 2, 60.0)

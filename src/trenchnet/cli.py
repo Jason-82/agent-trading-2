@@ -45,6 +45,7 @@ from .models import short
 from .profiler import build_roster
 from .reporter import Reporter, format_report
 from .store import Store
+from .textfile import read_text_any
 
 LIVE_ACK_ENV = "TRENCHNET_LIVE_ACK"
 LIVE_ACK_VALUE = "I understand this trades real funds"
@@ -75,18 +76,10 @@ def _judge(cfg: Config, llm: LLM | None):
 
 
 def _read_text_any(path: str) -> str:
-    """Text saved by Notepad, Excel or PowerShell: UTF-8 (with or without a
-    BOM), UTF-16, or the Windows ANSI code page."""
     try:
-        raw = Path(path).read_bytes()
+        return read_text_any(path)
     except OSError as e:
         sys.exit(f"can't read {path}: {e.strerror}")
-    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return raw.decode("utf-16")
-    try:
-        return raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return raw.decode("cp1252", errors="replace")
 
 
 def _read_wallets(path: str) -> tuple[list[str], dict[str, str]]:
@@ -231,6 +224,14 @@ _STOP_ADVICE = {
              "(Helius: monthly), add credits, or use another RPC URL, then run the same command again.",
     "transient": "The RPC kept failing (rate limits, server or network problems). Trades read so far are saved; "
                  "wait a while and run the same command again (already-saved trades are skipped).",
+}
+
+
+_FOMO_STOP_ADVICE = {
+    "quota": "Your RPC plan's credits are used up. Wait for the plan to reset (Helius: monthly), add credits or "
+             "use another RPC URL, then run `trenchnet fomo` again.",
+    "transient": "The RPC kept failing (rate limits, server or network problems). Wait a while and run "
+                 "`trenchnet fomo` again, or try --rps 2.",
 }
 
 
@@ -403,8 +404,7 @@ async def cmd_inspect(args, cfg: Config) -> None:
             sigs = await list_wallet_signatures(rpc, wallet, args.limit, retry_pause_s=2.0, successful_only=False)
         except (RpcHTTPError, RpcError) as e:
             sys.exit(f"Could not list the wallet's transactions: {e}")
-        print(f"Wallet {wallet}: its last {len(sigs)} transactions (including its USDC account's), newest first "
-              f"(read from {rpc.host})\n")
+        print(f"Wallet {wallet}: its last {len(sigs)} transactions, newest first (read from {rpc.host})\n")
         print(f"{'time (UTC)':<17}  {'read as':<27} {'SOL change':>11}  token changes (wallet-owned)")
         for s in sigs:
             sig = s["signature"]
@@ -490,21 +490,24 @@ async def cmd_fomo(args, cfg: Config) -> None:
         span = f", from {iso(found.span[0])[:16]} to {iso(found.span[1])[:16]} UTC"
     print(f"Read {found.read} of {found.listed:,} recent transactions{span}: {found.fomo_trades} trades "
           f"by {len(found.traders)} wallets ({found.no_trade} other transactions: deposits, withdrawals, ...).")
-    if found.unreadable:
-        print("  unreadable: " + ", ".join(f"{c} {r}" for r, c in found.unreadable.most_common()))
-    if found.stopped is not None:
-        print(f"Stopped early: {found.stopped}", file=sys.stderr)
+    unreadable = ", ".join(f"{c} {r}" for r, c in found.unreadable.most_common())
+    if unreadable:
+        print(f"  unreadable: {unreadable}")
+    if found.stopped is not None or (found.read == 0 and found.unreadable):
+        # The RPC is the problem, not Fomo's addresses.
+        why = str(found.stopped) if found.stopped is not None else f"none of them could be read ({unreadable})"
+        kind = found.stopped.kind if found.stopped is not None else "transient"
+        advice = _FOMO_STOP_ADVICE.get(kind) or _STOP_ADVICE.get(kind, "")
+        if not found.traders:
+            sys.exit(f"Could not read Fomo's transactions: {why}\n{advice}")
+        print(f"Stopped early: {why}\nOnly {found.read} of the {found.sampled} sampled transactions were read, so "
+              f"the list below is partial. {advice}", file=sys.stderr)
     if not found.traders:
         sys.exit("No Fomo trades were recognised. Fomo may have changed its fee account: open a recent Fomo trade on "
                  "Solscan, find the USDC account the app fee went to, and pass it with --account ADDRESS.")
     if found.found_by.get("signer"):
         print(f"  ({found.found_by['signer']} traders were recognised as the transaction's other signer, "
               "not by the fee payment)")
-    trades = sum(t.trades for t in found.traders.values())
-    own = sum(t.own_address_in_tx for t in found.traders.values())
-    if own < trades:
-        print(f"  In {trades - own} of {trades} trades the trader's own address wasn't in the transaction (only their "
-              "token accounts were); backfill reads those through the wallet's USDC account.")
 
     ranked = [t for t in found.ranked() if t.trades >= args.min_trades]
     print(f"\n{'#':>3}  {'wallet':<44}  {'trades':>6} {'buys':>5} {'sells':>5}  {'volume':>10}  tokens")
@@ -517,8 +520,13 @@ async def cmd_fomo(args, cfg: Config) -> None:
     if not top:
         sys.exit(f"No wallet made at least {args.min_trades} trades in the sample; try --min-trades 1 or a bigger --sample.")
     when = iso(found.span[1])[:10] if found.span else "today"
-    added, already = merge_wallet_file(
-        args.out, top, lambda t: f"Fomo sample {when}: {t.trades} trades, ${t.usd:,.0f}")
+    try:
+        added, already = merge_wallet_file(
+            args.out, top, lambda t: f"Fomo sample {when}: {t.trades} trades, ${t.usd:,.0f}")
+    except (OSError, UnicodeError) as e:  # open in Excel, a folder, ...: don't lose the finished run
+        print("\n".join(f"{t.wallet},fomo-{t.wallet[:4]}" for t in top))
+        sys.exit(f"Could not update {args.out} ({e}). The {len(top)} wallets are printed above: "
+                 "copy them into a wallets file yourself.")
     print(f"\nAdded {added} wallets to {args.out}" + (f" ({already} were already there)" if already else "")
           + ". Volume in a short sample says who is active and trades size, not who trades well:")
     print(f"  {_cmd('backfill ' + shlex.quote(args.out) + ' --limit 500', cfg)}     # their history (~2 min per wallet)")
@@ -617,7 +625,11 @@ async def cmd_run(args, cfg: Config) -> None:
         print("tip: set SOLANA_RPC_URL (your Helius URL) to also watch the wallets through your RPC; "
               "trades made in the Fomo app are only seen that way", file=sys.stderr)
 
+    stopping = False
+
     def stop_sources() -> None:
+        nonlocal stopping
+        stopping = True
         source.stop()
         if watcher is not None:
             watcher.stop()
@@ -691,6 +703,8 @@ async def cmd_run(args, cfg: Config) -> None:
     events = merge_events(source, watcher) if watcher is not None else source.events()
     try:
         async for ev in events:
+            if stopping:  # first Ctrl-C: events already received but not handled yet are dropped
+                break
             await engine.handle(ev)
     finally:
         await events.aclose()

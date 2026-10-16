@@ -63,6 +63,11 @@ line) before running `trenchnet`. On Windows the command is `python`, not
 Setting keys: `export NAME="value"` in Git Bash, macOS or Linux;
 `$env:NAME = "value"` in PowerShell. They last until you close the terminal.
 
+**Updating to a newer version:** stop any running `trenchnet run` first
+(Ctrl-C), then `git pull` and `pip install -e ".[dev]"`, then start it again.
+A newer version may add to `trenchnet.db`, and a bot started before the
+update can't write to it afterwards.
+
 The demo builds a roster from 30 days of synthetic history (keeping A–D,
 rejecting a scalper, a one-lucky-token wallet and a thin history), then
 replays the article's sequence. It skips the token only the recurring trio
@@ -154,9 +159,9 @@ with the same criteria as everyone else. Names (which wallet is which Fomo
 user) aren't available this way. If you know a particular trader's address,
 add it to `fomo.txt` yourself.
 
-Fomo sends its users' trades through its sponsor, so the trader's own
-address can be missing from them. The backfill therefore also reads each
-wallet's USDC account, and `trenchnet run` watches it too.
+Fomo's sponsor pays the network fee, but the trader signs each trade, so
+the trades are in the trader's own wallet history like anyone else's. They
+are paid in USDC; see step 2 above for how those are counted.
 
 ## Live trading
 

@@ -18,11 +18,9 @@ also pays a small tip is still a transfer. Transactions touching several
 tokens at once are skipped rather than guessed. Tips paid alongside a real
 trade remain inside its SOL amount.
 
-Some apps (Fomo, for one) send their users' trades from a sponsor wallet that
-pays the fees, so the user's own address may not appear in the transaction at
-all, only their token accounts. Their trades are found by also listing the
-transactions of the wallet's USDC account, and a wallet's token accounts are
-recognised by their owner rather than by the wallet signing.
+Some apps (Fomo, for one) send their users' trades with a sponsor wallet that
+pays the network fee. The trader still co-signs, so the trade is in the
+wallet's own history; the sponsor's fee simply isn't part of the trade.
 
 Transactions of every version (legacy, v0, and v1 from Sept 2026) are read.
 If a node can't return a transaction in readable form, or returns a layout
@@ -66,9 +64,6 @@ QUOTE_MINTS = {
 QUOTE_DUST = 1.0  # a stablecoin change under $1 beside a real SOL payment is leftover change, not the price
 MIN_QUOTE_MOVE = 0.1  # without a known swap program, a smaller stablecoin payment doesn't make a purchase
 
-TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
-
 # Swap programs: a token decrease in a transaction that calls one of these is a sale even when the
 # proceeds are nil (rugged coin) or eaten by tips; without them it would look like a transfer.
 # Concentrated-liquidity pools (Meteora DLMM, Raydium CLMM) are left out on purpose: adding
@@ -85,21 +80,6 @@ SWAP_PROGRAMS = {
     "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",  # Meteora DAMM v1
     "DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH",  # DFlow aggregator (routes Fomo's trades)
 }
-
-
-def usdc_account(wallet: str) -> str | None:
-    """The wallet's USDC token account (its associated token account), or
-    None if `wallet` isn't a valid address."""
-    from solders.pubkey import Pubkey
-
-    try:
-        owner = Pubkey.from_string(wallet)
-    except ValueError:
-        return None
-    ata, _ = Pubkey.find_program_address(
-        [bytes(owner), bytes(Pubkey.from_string(TOKEN_PROGRAM)), bytes(Pubkey.from_string(USDC))],
-        Pubkey.from_string(ATA_PROGRAM))
-    return str(ata)
 
 
 def _key(k: Any) -> str:
@@ -218,7 +198,7 @@ def analyze_wallet_tx(tx: dict | None, wallet: str, signature: str) -> TxView:
         if i == 0:
             native += meta.get("fee", 0) / LAMPORTS_PER_SOL
     elif pre or post:
-        native = 0.0  # only the wallet's token accounts took part (e.g. an app's sponsor sent the trade)
+        native = 0.0  # only the wallet's token accounts took part (another signer moved them)
     else:
         return TxView("not_in_tx")
     sol_delta = native
@@ -387,31 +367,8 @@ async def _list_address(rpc: SolanaRpc, address: str, max_signatures: int, retry
 
 async def list_wallet_signatures(rpc: SolanaRpc, wallet: str, max_signatures: int, retry_pause_s: float = 10.0,
                                  successful_only: bool = True) -> list[dict]:
-    """The wallet's transactions, newest first, together with those of its
-    USDC account: an app that sends trades for its users (Fomo) may leave the
-    wallet's own address out of them."""
-    sigs = await _list_address(rpc, wallet, max_signatures, retry_pause_s, successful_only)
-    ata = usdc_account(wallet)
-    if ata is None:
-        return sigs
-    try:
-        extra = await _list_address(rpc, ata, max_signatures, retry_pause_s, successful_only)
-    except RpcHTTPError as e:
-        if e.fatal:
-            raise
-        log.warning("could not list the transactions of %s's USDC account (%s); reading the wallet's own only",
-                    wallet, e)
-        return sigs
-    except RpcError as e:
-        log.warning("could not list the transactions of %s's USDC account (%s)", wallet, e)
-        return sigs
-    seen = {s["signature"] for s in sigs}
-    extra = [s for s in extra if s["signature"] not in seen]
-    if not extra:
-        return sigs
-    merged = sigs + extra
-    merged.sort(key=lambda s: -(s.get("slot") or 0))  # stable: keeps each list's own order within a slot
-    return merged[:max_signatures]
+    """The wallet's most recent transactions, newest first."""
+    return await _list_address(rpc, wallet, max_signatures, retry_pause_s, successful_only)
 
 
 async def backfill_wallet(rpc: SolanaRpc, wallet: str, max_signatures: int = 500,

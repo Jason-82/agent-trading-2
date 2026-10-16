@@ -13,7 +13,9 @@ the database, so each period is downloaded only once.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -86,6 +88,14 @@ SOURCES = (
 )
 
 
+def _refused(e: Exception) -> bool:
+    """An answer that won't change during this run: blocked in this country (403/451) or a bad request."""
+    if not isinstance(e, httpx.HTTPStatusError):
+        return False
+    code = e.response.status_code
+    return 400 <= code < 500 and code not in (408, 425, 429)
+
+
 def _why(e: Exception) -> str:
     if isinstance(e, httpx.HTTPStatusError):
         code = e.response.status_code
@@ -99,16 +109,20 @@ class SolUsdPrices:
     """Look up SOL/USD for past times; fetch what's needed first with prefetch()."""
 
     def __init__(self, store: "Store | None" = None, http: httpx.AsyncClient | None = None,
-                 sources: Iterable[PriceSource] | None = None, now: Callable[[], float] = time.time) -> None:
+                 sources: Iterable[PriceSource] | None = None, now: Callable[[], float] = time.time,
+                 monotonic: Callable[[], float] = time.monotonic, retry_pause_s: float = 2.0) -> None:
         self.store = store
         self._http = http
         self.sources = list(sources if sources is not None else SOURCES)
         self.now = now
+        self.monotonic = monotonic
+        self.retry_pause_s = retry_pause_s
         self._cache: dict[int, float] = {}
         self._asked: set[int] = set()  # buckets already requested this run (incl. ones with no candle)
         self._loaded: set[int] = set()  # days already loaded from the database
-        self._failures: dict[str, list[str]] = {}
-        self._off: set[str] = set()  # sources given up on for this run
+        self._fails: dict[str, int] = {}  # failures in a row, per source
+        self._until: dict[str, float] = {}  # source resting until this monotonic time (inf: not this run)
+        self._why: dict[str, str] = {}  # last failure, per source
         self.problem: str | None = None  # why prices are missing, for the user
 
     @property
@@ -145,44 +159,70 @@ class SolUsdPrices:
         await self.prefetch([ts])
         return self.get(ts)
 
+    def _usable(self) -> list[PriceSource]:
+        t = self.monotonic()
+        return [s for s in self.sources if self._until.get(s.name, 0.0) <= t]
+
     async def prefetch(self, timestamps: Iterable[float]) -> None:
         """Download the candles needed for these times (in as few requests as
-        possible). Never raises: if no source works, `problem` says why."""
+        possible). Never raises: if no source works, `problem` says why, and
+        the next call tries again (a source that failed rests a while first)."""
         need = sorted({bucket(t) for t in timestamps})
         if not need:
             return
         self._load(need[0] - NEAREST_S, need[-1] + NEAREST_S)
-        now = bucket(self.now())
+        now = max(bucket(self.now()), need[-1])  # a block's time can be ahead of this PC's clock
         missing = [b for b in need if b not in self._cache and b not in self._asked and b <= now]
         while missing:
-            source = next((s for s in self.sources if s.name not in self._off), None)
-            if source is None:
-                tried = "; ".join(f"{n}: {why[-1]}" for n, why in self._failures.items())
-                if self.problem is None:
-                    log.warning("no SOL/USD price source could be reached (%s)", tried)
-                self.problem = f"no SOL/USD price source could be reached ({tried})"
-                return
             start = missing[0]
-            end = min(start + (source.max_candles - 1) * BUCKET_S, now)
-            try:
-                rows = await source.fetch(self.http, start, end)
-            except Exception as e:  # noqa: BLE001 - any failure: try the next source
-                self._failed(source, e)
-                continue
-            got = [(b, p, source.name) for b, p in rows if p > 0 and b % BUCKET_S == 0]
-            self._cache.update((b, p) for b, p, _ in got)
-            if self.store is not None and got:
-                self.store.save_sol_usd(got)
-            settled = bucket(self.now() - SETTLED_S)
-            self._asked.update(b for b in range(start, end + 1, BUCKET_S) if b <= settled)
+            if start > bucket(self.now() - SETTLED_S):
+                # A recent trade: its candle may not be published yet, so also fetch the half hour
+                # before it for get()'s nearest-candle fallback (still one request).
+                start -= NEAREST_S
+            end = await self._fetch_window(start, now)
+            if end is None:
+                why = "; ".join(f"{n}: {w}" for n, w in self._why.items())
+                if self.problem is None:
+                    log.warning("no SOL/USD price source could be reached (%s)", why)
+                self.problem = f"no SOL/USD price source could be reached ({why})"
+                return
             missing = [b for b in missing if b > end]
 
+    async def _fetch_window(self, start: int, now: int) -> int | None:
+        """One window of candles from the first source that answers (two rounds, a short pause
+        between). Returns the window's last bucket, or None if no source answered."""
+        for round_ in range(2):
+            for source in self._usable():
+                end = min(start + (source.max_candles - 1) * BUCKET_S, now)
+                try:
+                    rows = await source.fetch(self.http, start, end)
+                except Exception as e:  # noqa: BLE001 - any failure: try the next source
+                    self._failed(source, e)
+                    continue
+                self._fails.pop(source.name, None)
+                self._until.pop(source.name, None)
+                self._why.pop(source.name, None)
+                self.problem = None
+                got = [(b, p, source.name) for b, p in rows if p > 0 and b % BUCKET_S == 0]
+                self._cache.update((b, p) for b, p, _ in got)
+                if self.store is not None and got:
+                    self.store.save_sol_usd(got)
+                settled = bucket(self.now() - SETTLED_S)
+                self._asked.update(b for b in range(start, end + 1, BUCKET_S) if b <= settled)
+                return end
+            resting = [s for s in self.sources if self._until.get(s.name, 0.0) < math.inf]
+            if round_ == 0 and resting:
+                await asyncio.sleep(self.retry_pause_s)
+        return None
+
     def _failed(self, source: PriceSource, e: Exception) -> None:
-        why = _why(e)
-        self._failures.setdefault(source.name, []).append(why)
-        # A refusal (blocked, bad request) won't change during this run; network trouble gets 3 tries.
-        refused = isinstance(e, httpx.HTTPStatusError) and 400 <= e.response.status_code < 500 \
-            and e.response.status_code != 429
-        if refused or len(self._failures[source.name]) >= 3 or not isinstance(e, httpx.HTTPError):
-            self._off.add(source.name)
-            log.info("SOL/USD prices: not using %s (%s)", source.name, why)
+        why = self._why[source.name] = _why(e)
+        if _refused(e):
+            self._until[source.name] = math.inf
+            log.info("SOL/USD prices: not using %s this run (%s)", source.name, why)
+            return
+        # Network trouble, rate limits, server errors, odd answers (a Wi-Fi login page): temporary.
+        # After two in a row the source rests 1, 2, 4 ... up to 15 minutes before it is asked again.
+        n = self._fails[source.name] = self._fails.get(source.name, 0) + 1
+        if n >= 2:
+            self._until[source.name] = self.monotonic() + min(60.0 * 2 ** (n - 2), 900.0)

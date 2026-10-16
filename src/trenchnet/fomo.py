@@ -26,8 +26,9 @@ from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
 from .models import Side
 from .solana_rpc import RpcError, RpcHTTPError, SolanaRpc
-from .sources.rpc_backfill import (QUOTE_MINTS, _list_address, _reason, account_keys, analyze_wallet_tx,
+from .sources.rpc_backfill import (BREAKER, QUOTE_MINTS, _list_address, _reason, account_keys, analyze_wallet_tx,
                                    fetch_transaction)
+from .textfile import read_text_any
 
 if TYPE_CHECKING:
     from .prices import SolUsdPrices
@@ -49,7 +50,6 @@ class Trader:
     sells: int = 0
     usd: float = 0.0  # volume in the sample, in dollars (SOL trades converted when a price is known)
     tokens: set[str] = field(default_factory=set)
-    own_address_in_tx: int = 0  # trades where the wallet's own address was part of the transaction
     first_ts: float | None = None
     last_ts: float | None = None
 
@@ -149,6 +149,7 @@ async def discover(rpc: SolanaRpc, accounts: Iterable[str] = (FOMO_FEE_ACCOUNT,)
     out.sampled = len(chosen)
     times: list[float] = []
     pending_usd: list[tuple[Trader, float, float]] = []  # SOL trades to convert: (trader, SOL, time)
+    streak = 0  # HTTP-level failures in a row: stop instead of grinding through an outage for hours
     for n, s in enumerate(chosen, 1):
         sig = s["signature"]
         try:
@@ -158,16 +159,24 @@ async def discover(rpc: SolanaRpc, accounts: Iterable[str] = (FOMO_FEE_ACCOUNT,)
                 out.stopped = e
                 break
             out.unreadable[_reason(e)] += 1
+            streak += 1
+            if streak >= BREAKER:
+                out.stopped = RpcHTTPError(e.status, f"{BREAKER} transactions in a row failed ({e})")
+                break
+            if progress:
+                progress(n, len(chosen), len(out.traders))
             continue
         except RpcError as e:
             out.unreadable[_reason(e)] += 1
+            if progress:
+                progress(n, len(chosen), len(out.traders))
             continue
+        streak = 0
         out.read += 1
         if tx.get("blockTime"):
             times.append(float(tx["blockTime"]))
         wallets, how = find_traders(tx, fee_accounts={FOMO_FEE_ACCOUNT, *accounts})
         traded = False
-        keys = set(account_keys(tx))
         for w in wallets:
             view = analyze_wallet_tx(tx, w, sig)
             t = view.trade or view.pending
@@ -179,7 +188,6 @@ async def discover(rpc: SolanaRpc, accounts: Iterable[str] = (FOMO_FEE_ACCOUNT,)
             tr.buys += t.side is Side.BUY
             tr.sells += t.side is Side.SELL
             tr.tokens.add(t.mint)
-            tr.own_address_in_tx += w in keys
             tr.first_ts = t.ts if tr.first_ts is None else min(tr.first_ts, t.ts)
             tr.last_ts = t.ts if tr.last_ts is None else max(tr.last_ts, t.ts)
             if t.quote_mint in QUOTE_MINTS:
@@ -206,16 +214,20 @@ async def discover(rpc: SolanaRpc, accounts: Iterable[str] = (FOMO_FEE_ACCOUNT,)
 
 def merge_wallet_file(path: str, traders: list[Trader], note: Callable[[Trader], str]) -> tuple[int, int]:
     """Add traders to a wallets file (address,nickname per line), keeping what
-    is already there. Returns (added, already present)."""
+    is already there; the file is (re)written as UTF-8. Returns (added,
+    already present). Raises OSError if the file can't be read or written."""
     from pathlib import Path
 
     p = Path(path)
-    existing = p.read_text(encoding="utf-8-sig") if p.exists() else ""
-    have = {line.split("#", 1)[0].replace(",", " ").split()[0] for line in existing.splitlines()
-            if line.split("#", 1)[0].strip()}
+    existing = read_text_any(p) if p.exists() else ""
+    have = set()
+    for line in existing.splitlines():
+        words = line.split("#", 1)[0].replace(",", " ").split()
+        if words:
+            have.add(words[0].lstrip("\ufeff"))
     new = [t for t in traders if t.wallet not in have]
     if new:
         lines = [f"{t.wallet},fomo-{t.wallet[:4]}  # {note(t)}" for t in new]
-        sep = "" if not existing or existing.endswith("\n") else "\n"
+        sep = "" if not existing or existing.endswith(("\n", "\r")) else "\n"
         p.write_text(existing + sep + "\n".join(lines) + "\n", encoding="utf-8")
     return len(new), len(traders) - len(new)

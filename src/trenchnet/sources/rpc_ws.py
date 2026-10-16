@@ -4,9 +4,9 @@ PumpPortal reports the trades it decodes on pump.fun and PumpSwap, under the
 account that called pump.fun. A trade routed through an aggregator, or sent
 by an app's sponsor wallet (every Fomo trade), may not show up there under
 the trader's wallet at all. This source asks the RPC's websocket for every
-transaction that mentions a followed wallet or its USDC account
-(`logsSubscribe`), reads each one with the same reader as the backfill, and
-reports the buys and sells, including stablecoin-priced ones valued in SOL.
+transaction that mentions a followed wallet (`logsSubscribe`), reads each one
+with the same reader as the backfill, and reports the buys and sells,
+including stablecoin-priced ones valued in SOL.
 
 It costs one getTransaction call per transaction of a followed wallet.
 """
@@ -24,7 +24,7 @@ import websockets
 
 from ..models import Trade
 from ..solana_rpc import RpcError, RpcHTTPError, SolanaRpc
-from .rpc_backfill import TxNotFound, analyze_wallet_tx, fetch_transaction, usdc_account, value_in_sol
+from .rpc_backfill import TxNotFound, analyze_wallet_tx, fetch_transaction, value_in_sol
 
 if TYPE_CHECKING:
     from ..prices import SolUsdPrices
@@ -41,6 +41,8 @@ def ws_url_from(rpc_url: str) -> str:
 
 
 class RpcWalletSource:
+    HEALTHY_S = 30.0  # a connection that lasted this long resets the reconnect delay, however it ended
+
     def __init__(self, rpc: SolanaRpc, wallets: Iterable[str], ws_url: str | None = None,
                  prices: "SolUsdPrices | None" = None, fetch_attempts: int = 5, fetch_pause_s: float = 1.0) -> None:
         self.rpc = rpc
@@ -48,16 +50,13 @@ class RpcWalletSource:
         self.prices = prices
         self.fetch_attempts = fetch_attempts
         self.fetch_pause_s = fetch_pause_s
-        self.watch: dict[str, str] = {}  # address -> followed wallet (the wallet itself and its USDC account)
-        for w in sorted(set(wallets)):
-            self.watch[w] = w
-            ata = usdc_account(w)
-            if ata is not None:
-                self.watch[ata] = w
+        self.watch: dict[str, str] = {w: w for w in sorted(set(wallets))}  # address -> followed wallet
         self._seen: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._tasks: set[asyncio.Task] = set()
+        self._last: dict[str, asyncio.Task] = {}  # wallet -> its latest read, which later reads wait for
         self._ws = None
         self._stop = False
+        self._stopped = asyncio.Event()
 
     @property
     def host(self) -> str:
@@ -66,6 +65,7 @@ class RpcWalletSource:
 
     def stop(self) -> None:
         self._stop = True
+        self._stopped.set()
         if self._ws is not None:
             asyncio.get_running_loop().create_task(self._ws.close())
 
@@ -85,24 +85,34 @@ class RpcWalletSource:
             await asyncio.gather(runner, *self._tasks, return_exceptions=True)
 
     async def _run(self, queue: asyncio.Queue) -> None:
+        loop = asyncio.get_running_loop()
         backoff = 1.0
         try:
             while not self._stop:
+                connected_at = None
                 try:
-                    async with websockets.connect(self.ws_url, ping_interval=20, max_size=2**22) as ws:
+                    async with websockets.connect(self.ws_url, ping_interval=20, max_size=2**22,
+                                                  open_timeout=10) as ws:
                         self._ws = ws
+                        connected_at = loop.time()
                         await self._listen(ws, queue)
-                        backoff = 1.0
                 except websockets.InvalidURI:
                     log.error("the RPC websocket address for %s is not valid; not watching wallets through it", self.host)
                     return
-                except (OSError, websockets.WebSocketException) as e:
+                except (OSError, asyncio.TimeoutError, websockets.WebSocketException) as e:
+                    if connected_at is not None and loop.time() - connected_at >= self.HEALTHY_S:
+                        backoff = 1.0
                     log.warning("RPC websocket %s: connection lost (%s); reconnecting in %.0fs",
                                 self.host, type(e).__name__, backoff)
+                else:
+                    backoff = 1.0
                 finally:
                     self._ws = None
                 if not self._stop:
-                    await asyncio.sleep(backoff)
+                    try:  # a stop() during the wait ends it at once
+                        await asyncio.wait_for(self._stopped.wait(), backoff)
+                    except asyncio.TimeoutError:
+                        pass
                     backoff = min(backoff * 2, 60.0)
         finally:
             await queue.put(_DONE)
@@ -140,18 +150,34 @@ class RpcWalletSource:
             if address is None or not sig or value.get("err") is not None:
                 continue
             wallet = self.watch[address]
-            if (sig, wallet) in self._seen:  # the wallet and its USDC account both report it
+            if (sig, wallet) in self._seen:  # e.g. notified again after a reconnect
                 continue
             self._seen[(sig, wallet)] = None
             if len(self._seen) > 10_000:
                 self._seen.popitem(last=False)
-            task = asyncio.create_task(self._read(sig, wallet, queue))
+            # Reads run in parallel, but each wallet's trades are reported in the order they were
+            # notified: a sell that reads faster than the buy before it must not overtake it.
+            task = asyncio.create_task(self._read(sig, wallet, queue, self._last.get(wallet)))
+            self._last[wallet] = task
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
+            task.add_done_callback(lambda t, w=wallet: self._last.get(w) is t and self._last.pop(w))
             if self._stop:
                 return
 
-    async def _read(self, sig: str, wallet: str, queue: asyncio.Queue) -> None:
+    async def _read(self, sig: str, wallet: str, queue: asyncio.Queue, previous: asyncio.Task | None) -> None:
+        trade = None
+        try:
+            trade = await self._read_one(sig, wallet)
+        except Exception:  # noqa: BLE001 - one unreadable transaction must not stop the watcher
+            log.exception("could not read %s's transaction %s", wallet, sig)
+        finally:
+            if previous is not None:  # wait for the wallet's earlier read however it ends
+                await asyncio.wait([previous])
+        if trade is not None and trade.side.is_trade:  # like PumpPortal: buys and sells only
+            await queue.put(trade)
+
+    async def _read_one(self, sig: str, wallet: str) -> Trade | None:
         tx = None
         for attempt in range(self.fetch_attempts):
             try:
@@ -161,25 +187,23 @@ class RpcWalletSource:
                 await asyncio.sleep(self.fetch_pause_s * (attempt + 1))
             except (RpcHTTPError, RpcError) as e:
                 log.warning("could not read %s's transaction %s: %s", wallet, sig, e)
-                return
+                return None
         if tx is None:
             log.warning("transaction %s of %s never became readable", sig, wallet)
-            return
+            return None
         try:
             view = analyze_wallet_tx(tx, wallet, sig)
         except (KeyError, TypeError, IndexError, ValueError) as e:
             log.warning("could not read transaction %s (%s)", sig, e)
-            return
-        trade = view.trade
-        if trade is None and view.pending is not None:
+            return None
+        if view.trade is None and view.pending is not None:
             price = await self.prices.price_at(view.pending.ts) if self.prices is not None else None
             if not price:
                 log.warning("%s traded %s in a stablecoin, but no SOL/USD price is available (%s)",
                             wallet, view.pending.mint, self.prices.problem if self.prices else "no price source")
-                return
-            trade = value_in_sol(view, price)
-        if trade is not None and trade.side.is_trade:  # like PumpPortal: buys and sells only
-            await queue.put(trade)
+                return None
+            return value_in_sol(view, price)
+        return view.trade
 
 
 async def merge_events(*sources) -> AsyncIterator:

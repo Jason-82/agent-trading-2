@@ -4,11 +4,14 @@ never rewrites an earlier one, so you can follow how a reading evolved."""
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
 from .models import Side, Trade
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
@@ -106,10 +109,16 @@ class Store:
     def _migrate(self) -> None:
         """Bring a database made by an older version up to date."""
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(trades)")}
+        added = []
         for name, kind in (("quote_mint", "TEXT"), ("quote_amount", "REAL")):
             if name not in cols:
                 self.db.execute(f"ALTER TABLE trades ADD COLUMN {name} {kind}")
+                added.append(name)
         self.db.commit()
+        if added and self.path != ":memory:" and self.db.execute("SELECT COUNT(*) FROM trades").fetchone()[0]:
+            # An older version still running on this file can't write trades any more.
+            log.warning("updated %s for this version of trenchnet; if a `trenchnet run` started before the "
+                        "update is still running, stop it and start it again", self.path)
 
     def close(self) -> None:
         self.db.close()
@@ -136,22 +145,45 @@ class Store:
         database transaction; rows for other signatures (older history, trades
         seen live) are untouched.
 
+        Trades in the same second replay in the order they were saved, so a
+        second is only rewritten in chain order when this reading covers every
+        row stored for it. Where it doesn't (a neighbour couldn't be read this
+        time, or was seen live), rows that read the same are updated where they
+        are instead of being moved behind their neighbours.
+
         Returns (rows that weren't stored before, old rows that are gone because
         the transaction now reads differently)."""
         trades = list(trades)
         sigs = sorted(set(signatures) | {t.signature for t in trades})
-        old: set[tuple] = set()
+        sig_set = set(sigs)
+        new_keys = {t.key for t in trades}
         with self.db:
+            rows: list[sqlite3.Row] = []
             for i in range(0, len(sigs), 500):  # stay under SQLite's limit on query parameters
                 chunk = sigs[i:i + 500]
-                where = f"wallet = ? AND source = ? AND signature IN ({','.join('?' * len(chunk))})"
-                args = [wallet, source, *chunk]
-                old |= {tuple(r) for r in self.db.execute(
-                    f"SELECT signature, wallet, mint, side FROM trades WHERE {where}", args)}
-                self.db.execute(f"DELETE FROM trades WHERE {where}", args)
-            inserted = self.db.executemany(self._INSERT, [self._row(t) for t in trades]).rowcount
-        new_keys = {t.key for t in trades}
-        return inserted - len(old & new_keys), len(old - new_keys)
+                rows += self.db.execute(
+                    f"SELECT signature, wallet, mint, side, ts FROM trades WHERE wallet = ? AND source = ?"
+                    f" AND signature IN ({','.join('?' * len(chunk))})", [wallet, source, *chunk]).fetchall()
+            old = {tuple(r)[:4] for r in rows}
+            partial: set[float] = set()
+            for ts in {r["ts"] for r in rows} | {t.ts for t in trades}:
+                for r in self.db.execute("SELECT signature, source FROM trades WHERE wallet = ? AND ts = ?",
+                                         (wallet, ts)):
+                    if r["source"] != source or r["signature"] not in sig_set:
+                        partial.add(ts)
+                        break
+            keep = {tuple(r)[:4] for r in rows if r["ts"] in partial} & new_keys
+            self.db.executemany(
+                "DELETE FROM trades WHERE signature = ? AND wallet = ? AND mint = ? AND side = ? AND source = ?",
+                [(*k, source) for k in old - keep])
+            self.db.executemany(
+                "UPDATE trades SET sol_amount = ?, token_amount = ?, ts = ?, market_cap_sol = ?, price_sol = ?,"
+                " quote_mint = ?, quote_amount = ? WHERE signature = ? AND wallet = ? AND mint = ? AND side = ?"
+                " AND source = ?",
+                [(t.sol_amount, t.token_amount, t.ts, t.market_cap_sol, t.price_sol, t.quote_mint, t.quote_amount,
+                  *t.key, source) for t in trades if t.key in keep])
+            inserted = self.db.executemany(self._INSERT, [self._row(t) for t in trades if t.key not in keep]).rowcount
+        return inserted - len((old - keep) & new_keys), len(old - new_keys)
 
     def traded_mints(self, wallet: str) -> set[str]:
         """Tokens the wallet bought or sold in the stored history."""

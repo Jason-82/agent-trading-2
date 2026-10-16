@@ -12,8 +12,7 @@ from trenchnet.ledger import Ledger
 from trenchnet.models import Side, Trade
 from trenchnet.prices import BUCKET_S, PriceSource, SolUsdPrices, _binance, _coinbase
 from trenchnet.solana_rpc import RpcError, RpcHTTPError
-from trenchnet.sources.rpc_backfill import (USDC, BackfillResult, analyze_wallet_tx, backfill_wallet,
-                                            usdc_account, value_in_sol)
+from trenchnet.sources.rpc_backfill import USDC, BackfillResult, analyze_wallet_tx, backfill_wallet, value_in_sol
 from trenchnet.stats import compute_wallet_stats
 from trenchnet.store import Store
 
@@ -39,27 +38,33 @@ FEE = 5000
 T0 = 1_760_000_000
 
 
-def tx(native_change, tokens_pre, tokens_post, programs=(), rent=None, wallet_in_tx=True, time=T0):
+def tx(native_change, tokens_pre, tokens_post, programs=(), rent=None, wallet_in_tx=True, time=T0, sponsor=False):
     """A jsonParsed-like transaction. tokens_*: {mint: amount}; each mint has its
     own wallet-owned token account, open before/after iff the mint is listed.
-    native_change: the wallet's lamport change including the fee it paid.
-    wallet_in_tx=False: a sponsor sends and pays for it, only the wallet's token
-    accounts take part."""
+    native_change: the wallet's lamport change (including the fee if it paid it).
+    sponsor=True: another wallet pays the fee and the wallet co-signs, as in a
+    Fomo trade. wallet_in_tx=False: only the wallet's token accounts take part."""
     rent = rent or {}
     mints = sorted(set(tokens_pre) | set(tokens_post))
-    keys = [W if wallet_in_tx else SPONSOR] + [f"Ata{m[:6]}" for m in mints] + list(programs)
+    lead = [SPONSOR] if sponsor or not wallet_in_tx else []
+    keys = lead + ([W] if wallet_in_tx else []) + [f"Ata{m[:6]}" for m in mints] + list(programs)
+    first_ata = keys.index(f"Ata{mints[0][:6]}") if mints else len(keys)
     n = len(keys)
-    pre = [10**10] + [0] * (n - 1)
-    post = [10**10 + (native_change if wallet_in_tx else -FEE)] + [0] * (n - 1)
-    for j, m in enumerate(mints, 1):
+    pre, post = [10**10] * n, [10**10] * n
+    if lead:
+        post[0] -= FEE
+    if wallet_in_tx:
+        post[keys.index(W)] += native_change
+    for j, m in enumerate(mints, first_ata):
         pre[j] = rent.get(m, RENT) if m in tokens_pre else 0
         post[j] = rent.get(m, RENT) if m in tokens_post else 0
 
     def bal(tokens):
-        return [{"accountIndex": mints.index(m) + 1, "owner": W, "mint": m,
+        return [{"accountIndex": first_ata + mints.index(m), "owner": W, "mint": m,
                  "uiTokenAmount": {"uiAmountString": str(a)}} for m, a in tokens.items()]
 
-    return {"blockTime": time, "transaction": {"message": {"accountKeys": [{"pubkey": k} for k in keys]}},
+    return {"blockTime": time,
+            "transaction": {"message": {"accountKeys": [{"pubkey": k, "signer": k in (W, SPONSOR)} for k in keys]}},
             "meta": {"err": None, "fee": FEE, "preBalances": pre, "postBalances": post,
                      "preTokenBalances": bal(tokens_pre), "postTokenBalances": bal(tokens_post)}}
 
@@ -138,10 +143,12 @@ def test_tiny_usdc_payment_needs_a_swap_program():
         (Side.BUY, USDC, pytest.approx(0.05))
 
 
-def test_trade_sent_by_a_sponsor_is_read_from_the_wallets_token_accounts():
-    # Fomo-style: the wallet's address isn't in the transaction; the sponsor paid fee and rent.
-    t = tx(0, {USDC: 150}, {USDC: 0, COIN: 1000}, programs=[PUMP], wallet_in_tx=False)
-    assert read(t) == (Side.BUY, USDC, 150.0, 0.0)
+def test_trade_paid_for_by_a_sponsor():
+    # Fomo: the sponsor pays the fee and the new coin account's rent; the trader co-signs.
+    assert read(tx(0, {USDC: 150}, {USDC: 0, COIN: 1000}, programs=[PUMP], sponsor=True)) == (Side.BUY, USDC, 150.0, 0.0)
+    # Only the wallet's token accounts in it (another signer moved them): still read by owner.
+    assert read(tx(0, {USDC: 150}, {USDC: 0, COIN: 1000}, programs=[PUMP], wallet_in_tx=False)) == \
+        (Side.BUY, USDC, 150.0, 0.0)
     assert analyze_wallet_tx(tx(0, {}, {}, wallet_in_tx=False), W, "s").status == "not_in_tx"
 
 
@@ -205,16 +212,13 @@ async def test_without_a_price_usdc_trades_are_left_out_and_counted():
     assert res.trades == [] and res.unpriced == 1 and res.ignored["other_quote"] == 1
 
 
-async def test_trades_only_visible_through_the_usdc_account_are_found():
-    ata = usdc_account(W)
-    rpc = FakeRpc({W: listing("own"), ata: listing("viaApp", "own")}, {
-        "own": tx(-FEE - 500_000_000 - RENT, {}, {COIN: 1000}, programs=[PUMP]),
-        "viaApp": tx(0, {"Other": 0, USDC: 150}, {"Other": 10, USDC: 0}, programs=[PUMP], wallet_in_tx=False),
-    })
-    res = await backfill_wallet(rpc, W, max_signatures=10, retry_pause_s=0, prices=fixed_prices())
-    assert sorted(t.signature for t in res.trades) == ["own", "viaApp"]
-    assert res.transactions == 2  # "own" is listed by both addresses but read once
-    assert rpc.listed == [W, ata]
+async def test_fomo_trade_is_read_from_the_wallets_own_history():
+    # Fomo's sponsor pays the fee (and the coin account's rent); the trader co-signs.
+    rpc = FakeRpc({W: listing("fomoBuy")}, {
+        "fomoBuy": tx(0, {COIN: 0, USDC: 150}, {COIN: 1000, USDC: 0}, programs=[PUMP], sponsor=True)})
+    res = await backfill_wallet(rpc, W, max_signatures=10, retry_pause_s=0, prices=fixed_prices(150.0))
+    assert [(t.side, t.sol_amount, t.quote_amount) for t in res.trades] == [(Side.BUY, 1.0, 150.0)]
+    assert rpc.listed == [W]  # nothing else is listed: the wallet's own history has every trade
 
 
 async def test_transaction_the_rpc_returns_nothing_for_is_unreadable_not_failed():
@@ -435,3 +439,113 @@ async def test_exchange_answers_are_parsed():
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         assert await _coinbase(http, T0, T0 + 300) == [(T0 + 300, 151.0), (T0, 149.0)]
         assert await _binance("https://data-api.binance.vision", "SOLUSDT")(http, T0, T0) == [(T0, 149.0)]
+
+
+# -- review round 4 ----------------------------------------------------------------
+
+def test_rerun_with_an_unreadable_neighbour_keeps_same_second_order(monkeypatch, tmp_path):
+    txs = {
+        "s0": tx(-FEE + 600_000_000 + RENT, {COIN: 1000}, {}, programs=[PUMP]),  # sell, after s1, same second
+        "s1": tx(-FEE - 500_000_000 - RENT, {}, {COIN: 1000}, programs=[PUMP]),  # buy
+    }
+    _run_backfill(monkeypatch, tmp_path, FakeRpc({W: listing("s0", "s1")}, dict(txs)))
+    assert [t.signature for t in Store(tmp_path / "t.db").trades()] == ["s1", "s0"]
+    txs["s0"] = RpcError(-32009, "missing in long-term storage")  # this time the sell can't be read
+    _run_backfill(monkeypatch, tmp_path, FakeRpc({W: listing("s0", "s1")}, txs))
+    trades = Store(tmp_path / "t.db").trades()
+    assert [t.signature for t in trades] == ["s1", "s0"]
+    assert compute_wallet_stats(W, trades).realized_pnl_sol == pytest.approx(0.1)
+
+
+def test_rerun_that_reads_the_whole_second_puts_it_back_in_chain_order(tmp_path):
+    store = Store(tmp_path / "t.db")
+    store.add_trades([Trade("s0", W, COIN, Side.SELL, 0.6, 1000, T0, source="rpc"),  # saved out of order
+                      Trade("s1", W, COIN, Side.BUY, 0.5, 1000, T0, source="rpc")])
+    store.replace_trades(W, [Trade("s1", W, COIN, Side.BUY, 0.5, 1000, T0, source="rpc"),
+                             Trade("s0", W, COIN, Side.SELL, 0.6, 1000, T0, source="rpc")], {"s0", "s1"})
+    assert [t.signature for t in store.trades()] == ["s1", "s0"]
+
+
+def test_upgrading_an_old_database_says_to_restart_a_running_bot(tmp_path, caplog):
+    db = tmp_path / "old.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE trades (signature TEXT NOT NULL, wallet TEXT NOT NULL, mint TEXT NOT NULL,"
+                " side TEXT NOT NULL, sol_amount REAL NOT NULL, token_amount REAL NOT NULL, ts REAL NOT NULL,"
+                " market_cap_sol REAL, price_sol REAL, source TEXT, PRIMARY KEY (signature, wallet, mint, side))")
+    con.execute("INSERT INTO trades VALUES ('a', 'w', 'm', 'buy', 1.0, 10, 1, NULL, NULL, 'rpc')")
+    con.commit()
+    con.close()
+    Store(db)
+    assert "stop it and start it again" in caplog.text
+    caplog.clear()
+    Store(db)
+    assert caplog.text == ""  # only once
+
+
+class Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def _flaky(script, price=150.0):
+    """A source whose answers follow `script`: 'ok', 'down' (no connection), 'html' (a login page)."""
+    calls = []
+
+    async def fetch(http, start, end):
+        what = script[len(calls)] if len(calls) < len(script) else "ok"
+        calls.append(what)
+        if what == "down":
+            raise httpx.ConnectError("getaddrinfo failed")
+        if what == "html":
+            return httpx.Response(200, text="<html>log in to Wi-Fi</html>").json()
+        return [(b, price) for b in range(start, end + 1, BUCKET_S)]
+    return fetch, calls
+
+
+async def test_prices_recover_after_a_network_blip():
+    clock = Clock()
+    a, a_calls = _flaky(["down", "down"])
+    b, b_calls = _flaky(["down", "down"])
+    prices = SolUsdPrices(sources=[PriceSource("a", 300, a), PriceSource("b", 300, b)], now=lambda: T0 + 86400,
+                          monotonic=clock, retry_pause_s=0)
+    assert await prices.price_at(T0) is None and "could not connect" in prices.problem
+    assert len(a_calls) == len(b_calls) == 2  # two rounds, not a burst of retries
+    clock.t += 30
+    assert await prices.price_at(T0) is None  # both resting: no requests
+    assert len(a_calls) == 2
+    clock.t += 31  # rest over
+    assert await prices.price_at(T0) == 150.0 and prices.problem is None
+
+
+async def test_occasional_failures_never_switch_a_source_off():
+    clock = Clock()
+    fetch, calls = _flaky(["down", "ok", "down", "ok", "down", "ok"])
+    prices = SolUsdPrices(sources=[PriceSource("a", 1, fetch)], now=lambda: T0 + 86400, monotonic=clock,
+                          retry_pause_s=0)
+    for k in range(3):  # three lookups, days apart, each hitting one failure first
+        assert await prices.price_at(T0 + k * 2 * 86400 - 86400 * 4) == 150.0
+
+
+async def test_a_wifi_login_page_is_not_a_permanent_refusal():
+    clock = Clock()
+    fetch, calls = _flaky(["html", "html"])
+    prices = SolUsdPrices(sources=[PriceSource("a", 300, fetch)], now=lambda: T0 + 86400, monotonic=clock,
+                          retry_pause_s=0)
+    assert await prices.price_at(T0) is None
+    clock.t += 61
+    assert await prices.price_at(T0) == 150.0
+
+
+async def test_live_trade_is_priced_when_the_pc_clock_is_behind():
+    asked = []
+
+    async def fetch(http, start, end):
+        asked.append((start, end))
+        return [(b, 150.0) for b in range(start, end + 1, BUCKET_S) if b < (T0 // BUCKET_S) * BUCKET_S + BUCKET_S]
+    trade_ts = (T0 // BUCKET_S + 1) * BUCKET_S + 3  # 3 s into a new candle the exchange hasn't published yet
+    prices = SolUsdPrices(sources=[PriceSource("a", 300, fetch)], now=lambda: trade_ts - 20)  # PC 20 s behind
+    assert await prices.price_at(trade_ts) == 150.0
+    assert asked and asked[0][1] >= trade_ts // BUCKET_S * BUCKET_S

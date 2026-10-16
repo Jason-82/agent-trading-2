@@ -1,5 +1,6 @@
 """`trenchnet fomo`: finding Fomo traders from public transactions."""
 
+import pytest
 from solders.pubkey import Pubkey
 
 from trenchnet.fomo import (FOMO_FEE_ACCOUNT, FOMO_FEE_WALLET, FOMO_GAS_SPONSOR, discover, find_traders,
@@ -13,10 +14,12 @@ POOL = str(Pubkey.new_unique())  # pool authority (a program-derived address in 
 T0 = 1_760_000_000
 
 
-def fomo_tx(user, coin, usdc_paid=150.0, fee=1.5, buy=True, user_signs=False, fee_transfer=True, time=T0):
-    """A Fomo trade as jsonParsed returns it: the sponsor signs and pays, the
-    user's USDC pays the pool and Fomo's fee (on a buy) or receives the
-    proceeds and pays the fee from them (on a sale)."""
+def fomo_tx(user, coin, usdc_paid=150.0, fee=1.5, buy=True, user_signs=True, fee_transfer=True, time=T0):
+    """A Fomo trade as jsonParsed returns it (as in real 2026 Fomo transactions):
+    the sponsor pays the fee and the trader co-signs; the trader's USDC pays the
+    pool and Fomo's fee (on a buy) or receives the proceeds and pays the fee
+    from them (on a sale). user_signs=False: a variant where only the trader's
+    token accounts appear."""
     u_usdc, u_coin, pool_usdc, pool_coin = (str(Pubkey.new_unique()) for _ in range(4))
     keys = [FOMO_GAS_SPONSOR] + ([user] if user_signs else []) + [u_usdc, u_coin, FOMO_FEE_ACCOUNT, pool_usdc,
                                                                     pool_coin, PUMP]
@@ -53,10 +56,10 @@ def fomo_tx(user, coin, usdc_paid=150.0, fee=1.5, buy=True, user_signs=False, fe
 def test_the_trader_is_whoever_paid_fomos_fee():
     user = str(Pubkey.new_unique())
     assert find_traders(fomo_tx(user, "CoinA")) == ([user], "fee")
-    assert find_traders(fomo_tx(user, "CoinA", user_signs=True)) == ([user], "fee")
+    assert find_traders(fomo_tx(user, "CoinA", user_signs=False)) == ([user], "fee")
     # No parsed fee transfer: fall back to the signer that isn't Fomo's sponsor.
     assert find_traders(fomo_tx(user, "CoinA", user_signs=True, fee_transfer=False)) == ([user], "signer")
-    assert find_traders(fomo_tx(user, "CoinA", fee_transfer=False)) == ([], None)
+    assert find_traders(fomo_tx(user, "CoinA", user_signs=False, fee_transfer=False)) == ([], None)
 
 
 def test_sample_is_spread_over_the_whole_period():
@@ -68,15 +71,15 @@ async def test_discover_ranks_wallets_by_volume():
     big, small = str(Pubkey.new_unique()), str(Pubkey.new_unique())
     txs = {
         "t1": fomo_tx(big, "CoinA", usdc_paid=900),
-        "t2": fomo_tx(big, "CoinA", usdc_paid=1200, buy=False, user_signs=True),
+        "t2": fomo_tx(big, "CoinA", usdc_paid=1200, buy=False),
         "t3": fomo_tx(small, "CoinB", usdc_paid=20),
-        "t4": fomo_tx(str(Pubkey.new_unique()), "CoinC", fee_transfer=False),  # trader not identifiable
+        "t4": fomo_tx(str(Pubkey.new_unique()), "CoinC", user_signs=False, fee_transfer=False),  # unidentifiable
     }
     listing = [{"signature": s, "err": None, "blockTime": T0} for s in txs]
     found = await discover(FakeRpc({FOMO_FEE_ACCOUNT: listing}, txs), sample=10, retry_pause_s=0)
     assert [t.wallet for t in found.ranked()] == [big, small]
     b = found.traders[big]
-    assert (b.trades, b.buys, b.sells, b.usd, b.own_address_in_tx) == (2, 1, 1, 900 + 1200 - 1.5, 1)  # sale proceeds are net of the fee
+    assert (b.trades, b.buys, b.sells, b.usd) == (2, 1, 1, 900 + 1200 - 1.5)  # sale proceeds are net of the fee
     assert (found.read, found.fomo_trades, found.no_trade) == (4, 3, 1)
 
 
@@ -104,6 +107,64 @@ def test_fomo_command_writes_the_top_wallets(tmp_path, monkeypatch, capsys):
     cli.main(["fomo", "--rpc", "https://x/", "--db", str(tmp_path / "t.db"), "--out", str(out)])
     text = capsys.readouterr().out
     assert "3 trades by 2 wallets" in text and whale in text
-    assert "wasn't in the transaction" in text  # the user's address only appears through token accounts
     lines = out.read_text().splitlines()
     assert len(lines) == 1 and lines[0].startswith(f"{whale},fomo-{whale[:4]}")  # `other` made only 1 trade
+
+
+async def test_discover_stops_when_the_rpc_keeps_failing():
+    from trenchnet.solana_rpc import RpcHTTPError
+
+    user = str(Pubkey.new_unique())
+    txs = {f"t{i}": (fomo_tx(user, "CoinA") if i < 3 else RpcHTTPError(503, "HTTP 503 (server error)"))
+           for i in range(100)}
+    listing = [{"signature": s, "err": None, "blockTime": T0} for s in txs]
+    seen = []
+    found = await discover(FakeRpc({FOMO_FEE_ACCOUNT: listing}, txs), sample=100, retry_pause_s=0,
+                           progress=lambda d, t, n: seen.append(d))
+    assert found.stopped is not None and "in a row failed" in str(found.stopped)
+    assert found.read == 3 and sum(found.unreadable.values()) == 10 and user in found.traders
+    assert seen[-1] == 12  # progress kept moving through the failures
+
+
+def _fomo_cli(tmp_path, monkeypatch, txs, *extra):
+    import trenchnet.cli as cli
+
+    listing = [{"signature": s, "err": None, "blockTime": T0} for s in txs]
+    monkeypatch.setattr(cli, "_rpc_from", lambda url, rps=None: FakeRpc({FOMO_FEE_ACCOUNT: listing}, txs))
+    cli.main(["fomo", "--rpc", "https://x/", "--db", str(tmp_path / "t.db"), *extra])
+
+
+def test_fomo_blames_the_rpc_not_fomo_when_reads_fail(tmp_path, monkeypatch, capsys):
+    from trenchnet.solana_rpc import RpcHTTPError
+
+    txs = {f"t{i}": RpcHTTPError(429, "credits used up", kind="quota") for i in range(5)}
+    with pytest.raises(SystemExit) as e:
+        _fomo_cli(tmp_path, monkeypatch, txs, "--out", str(tmp_path / "f.txt"))
+    assert "Could not read Fomo's transactions" in str(e.value) and "credits are used up" in str(e.value)
+    assert "fee account" not in str(e.value)
+
+
+@pytest.mark.parametrize("encoding,content", [
+    ("utf-16", "{a},mine\n"),  # PowerShell 5.1 `>`
+    ("cp1252", "{a},café\n"),  # Notepad ANSI
+    ("utf-8", "wallet,alias\n,\n{a},mine\r\n"),  # Excel CSV with a header and a blank row
+])
+def test_fomo_adds_to_wallet_files_made_on_windows(tmp_path, encoding, content):
+    from trenchnet.cli import _read_wallets
+    from trenchnet.fomo import Trader
+
+    a, b = str(Pubkey.new_unique()), str(Pubkey.new_unique())
+    out = tmp_path / "w.txt"
+    out.write_bytes(content.format(a=a).encode(encoding))
+    assert merge_wallet_file(str(out), [Trader(a), Trader(b)], lambda t: "x") == (1, 1)
+    wallets, _ = _read_wallets(str(out))
+    assert wallets == [a, b]
+
+
+def test_fomo_prints_the_wallets_if_the_file_cant_be_written(tmp_path, monkeypatch, capsys):
+    whale = str(Pubkey.new_unique())
+    txs = {"t1": fomo_tx(whale, "CoinA"), "t2": fomo_tx(whale, "CoinB")}
+    with pytest.raises(SystemExit) as e:
+        _fomo_cli(tmp_path, monkeypatch, txs, "--out", str(tmp_path))  # a folder, like a file open in Excel
+    assert "Could not update" in str(e.value)
+    assert f"{whale},fomo-{whale[:4]}" in capsys.readouterr().out
