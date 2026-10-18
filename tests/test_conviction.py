@@ -1,6 +1,8 @@
 """Conviction buys: one followed wallet with a strong record buying far more
 than it usually does, copied on its own and followed out by that wallet."""
 
+from dataclasses import replace
+
 import pytest
 
 from trenchnet.brokers.base import Fill
@@ -267,3 +269,55 @@ async def test_an_exit_missed_once_is_not_lost_when_the_leader_starts_a_new_posi
     await e.handle(trade(MITCH, "buy", 0.001, 70, tokens=50))  # spam, recorded as tokens received
     assert e.portfolio.closed[-1]["exit_reason"] == ("mitch has left the position the bot followed "
                                                      "(and bought again since)")
+
+
+async def test_after_a_restart_it_knows_the_leader_left_even_if_it_came_back_within_a_minute():
+    e, _ = engine()
+    await e.handle(trade(MITCH, "buy", 19.6, 0))
+    # While the bot is off, mitch dumps and buys back 40 s after the bot's entry (seen by a backfill).
+    e.store.add_trades([trade(MITCH, "sell", 19.0, 20, tokens=1e6), trade(MITCH, "buy", 0.5, 40, tokens=2e4)])
+    again = restarted(e)
+    assert again.portfolio.holdings["Coin"].leader_round == 1
+    await again.tick(T0 + 100)
+    assert again.portfolio.closed[-1]["exit_reason"].startswith("mitch has left the position the bot followed")
+
+
+async def test_after_a_restart_a_backfill_with_another_clock_does_not_fake_an_exit():
+    e, _ = engine()
+    big = trade(MITCH, "buy", 19.6, 0)
+    await e.handle(big)
+    # The backfill stores the same buy with its on-chain time, 90 s after this PC's clock said.
+    e.store.replace_trades(MITCH, [replace(big, ts=big.ts + 90, source="rpc")], {big.signature})
+    old_fill = e.store.fills()[0]
+    for fill in ({**old_fill}, {**old_fill, "reason": old_fill["reason"].rpartition(" (buy ")[0]}):
+        again, _ = engine(history=e.store.trades())  # with the buy's signature, and an older fill without it
+        again.store = e.store
+        again.restore([fill])
+        assert again.portfolio.holdings["Coin"].leader_round == 1
+        await again.tick(T0 + 200)
+        assert "Coin" in again.portfolio.holdings
+
+
+async def test_after_a_restart_old_trades_in_the_token_do_not_count_as_the_buyers_it_followed():
+    e, _ = engine()
+    two_days = 2 * 86400
+    e.store.add_trades([trade(FROG, "buy", 1.0, -two_days, tokens=1e5), trade(FROG, "sell", 1.2, -two_days + 600, tokens=1e5)])
+    await e.handle(trade(MITCH, "buy", 19.6, 0))
+    again = restarted(e, {FROG: RECORDS[FROG], WEAK: RECORDS[WEAK]})  # mitch dropped from the roster
+    await again.tick(T0 + 60)
+    assert "Coin" in again.portfolio.holdings
+
+
+async def test_a_sale_that_arrives_before_the_buy_still_counts():
+    e, lines = engine()
+    await e.handle(trade(MITCH, "sell", 19.0, 3, tokens=1e6))  # PumpPortal: the sell, at once
+    await e.handle(trade(MITCH, "buy", 19.6, 0))  # the RPC watcher: the buy, read more slowly
+    assert e.portfolio.fills == [] and lines[-1].endswith("not followed: it has sold since")
+
+
+async def test_the_trade_line_leaves_out_the_address_and_signature():
+    e, lines = engine()
+    await e.handle(trade(MITCH, "buy", 19.6, 0))
+    [line] = [x for x in lines if "PAPER BUY" in x]
+    assert line.endswith("price 1.00x its buy") and MITCH not in line
+    assert e.store.fills()[0]["reason"].endswith(f"following {MITCH} (buy {e.cases['Coin'].events[0].signature})")

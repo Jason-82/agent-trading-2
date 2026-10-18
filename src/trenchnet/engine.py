@@ -24,7 +24,7 @@ from .cases import Case, TrackedWallet, build_snapshot, iso
 from .config import Config
 from .graph import TradeGraph
 from .judge import Judge, RouteDecision, route
-from .ledger import Ledger
+from .ledger import Ledger, Position
 from .models import PriceTick, Side, Trade, short
 from .portfolio import Portfolio
 from .reporter import Reporter, format_report
@@ -34,7 +34,8 @@ from .strategy import Order, Strategy
 log = logging.getLogger(__name__)
 
 _TP_REASON = re.compile(r"^take-profit (\d+):")
-_CONVICTION_REASON = re.compile(r"^conviction: .*; following (\S+)$")
+_CONVICTION_REASON = re.compile(r"^conviction: .*; following (\S+)(?: \(buy (\S+)\))?$")
+_FOLLOWING = re.compile(r"; following \S+(?: \(buy \S+\))?$")
 RESTORE_CLOCK_SLACK_S = 60.0  # stored trade times and fill times can come from different clocks
 
 
@@ -92,28 +93,44 @@ class Engine:
         """Rebuild the bot's holdings from stored fills after a restart, and
         reopen a case for each token still held so exits keep running."""
         names = {f.name for f in fields(Fill)}
+        copied: dict[str, str | None] = {}  # mint -> the leader's buy a conviction entry copied
         for row in fills:
             fill = Fill(**{k: row[k] for k in names})
             m = _TP_REASON.match(fill.reason) if fill.side == "sell" else None
             c = _CONVICTION_REASON.match(fill.reason) if fill.side == "buy" else None
+            if c and fill.mint not in self.portfolio.holdings:
+                copied[fill.mint] = c.group(2)
             self.portfolio.apply(fill, tp_index=int(m.group(1)) - 1 if m else None, leader=c.group(1) if c else None)
+        since = self.cfg.strategy.max_entry_delay_s + RESTORE_CLOCK_SLACK_S
         for mint, h in self.portfolio.holdings.items():
             case = self.cases[mint] = Case(mint=mint, opened_ts=h.entry_ts)
             for t in self.store.trades(wallets=list(self.tracked_set), mint=mint):
-                case.add_event(t)
+                if t.ts >= h.entry_ts - since:  # not old trades in the token, which aren't the buyers it followed
+                    case.add_event(t)
             if mint not in self.prices and case.last_price is not None:
                 self.prices[mint] = case.last_price
             if h.leader is None:
                 continue
-            lead = self.ledger.get(h.leader, mint)
-            if h.leader not in self.tracked_set or lead is None:
+            if h.leader not in self.tracked_set or self.ledger.get(h.leader, mint) is None:
                 log.warning("%s was bought following %s, which is no longer followed: it is now sold on the "
                             "price and time exits, or when the token's followed buyers sell", short(mint),
                             short(h.leader))
-            elif lead.first_buy_ts is not None and lead.first_buy_ts <= h.entry_ts + RESTORE_CLOCK_SLACK_S:
-                h.leader_round = lead.rounds  # still the position the bot followed
             else:
-                h.leader_round = lead.rounds - 1  # it left that position (and came back) while the bot was off
+                h.leader_round = self._followed_round(h.leader, mint, copied.get(mint), h.entry_ts)
+
+    def _followed_round(self, leader: str, mint: str, signature: str | None, entry_ts: float) -> int:
+        """Which of the leader's positions in the token (Position.rounds) the bot copied."""
+        lead = self.ledger.get(leader, mint)
+        if signature:  # replay its stored trades in the order the ledger was built from them
+            pos = Position(leader, mint)
+            for t in sorted(self.store.trades(wallets=[leader], mint=mint), key=lambda t: t.ts):
+                pos.apply(t)
+                if t.signature == signature:
+                    return pos.rounds
+        # An older fill without the buy's signature, or the buy isn't stored: judge by the time.
+        if lead.rounds == 1 or (lead.first_buy_ts is not None and lead.first_buy_ts <= entry_ts + RESTORE_CLOCK_SLACK_S):
+            return lead.rounds
+        return lead.rounds - 1  # it left that position (and came back) while the bot was off
 
     # -- events -----------------------------------------------------------
 
@@ -303,7 +320,7 @@ class Engine:
         tag = "BUY " if fill.side == "buy" else "SELL"
         extra = "" if fill.side == "buy" else f" pnl={pnl:+.4f} SOL"
         self.out(f"    ▶ {fill.mode.upper()} {tag} {short(fill.mint)} {fill.sol_amount:.4f} SOL @ "
-                 f"{fill.price_sol:.3e}{extra} — {fill.reason}")
+                 f"{fill.price_sol:.3e}{extra} — {_FOLLOWING.sub('', fill.reason)}")
         try:
             if fill.side == "buy" and self.on_hold:
                 await self.on_hold(fill.mint)

@@ -10,19 +10,18 @@ from __future__ import annotations
 
 import difflib
 import json
-import math
+import os
 import re
 import tomllib
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import Config, _apply
+from .config import Config, _apply, check_value
 from .textfile import read_text_any
 
 RESET_WORDS = ("default", "reset")
 _HEADER = re.compile(r"^\s*\[\s*([A-Za-z0-9_.-]+)\s*\]\s*(#.*)?$")
-_KEY_LINE = re.compile(r"^\s*[A-Za-z0-9_-]+\s*=")
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*=")  # a word that is itself section.key=value
 
 
@@ -82,6 +81,14 @@ def resolve(name: str) -> Setting:
                        "See them all with: trenchnet config " + " / ".join(sections()))
 
 
+def _is_setting(name: str) -> bool:
+    try:
+        resolve(name)
+        return True
+    except SettingError:
+        return False
+
+
 def parse_value(setting: Setting, raw: str) -> Any:
     """The value typed after '=', checked against the setting's type. None means back to the default."""
     raw = raw.strip()
@@ -93,33 +100,12 @@ def parse_value(setting: Setting, raw: str) -> Any:
         value = tomllib.loads(f"v = {raw}")["v"]
     except tomllib.TOMLDecodeError:
         value = raw  # a bare word, e.g. auto or claude-haiku-4-5
-    kind = setting.type.replace(" | None", "").strip()
-    number = isinstance(value, (int, float)) and not isinstance(value, bool)
-    if kind == "str":
-        return value if isinstance(value, str) else raw
-    if kind == "bool":
-        if isinstance(value, bool):
-            return value
-        raise SettingError(f"{setting.name} must be true or false, not {raw}")
-    if kind in ("int", "float"):
-        if not number or not math.isfinite(value):
-            raise SettingError(f"{setting.name} must be a number, not {raw}")
-        if value < 0:
-            raise SettingError(f"{setting.name} can't be negative")
-        if kind == "int":
-            if value != int(value):
-                raise SettingError(f"{setting.name} must be a whole number, not {raw}")
-            return int(value)
-        return value
-    if kind == "list[list[float]]":
-        ok = isinstance(value, list) and all(
-            isinstance(p, list) and len(p) == 2
-            and all(isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0 for x in p) for p in value)
-        if not ok:
-            raise SettingError(f"{setting.name} must be a list of [multiple, fraction] pairs, "
-                               "e.g. [[2.0, 0.5], [4.0, 0.25]]")
-        return value
-    return value
+    if setting.type.replace(" | None", "").strip() == "str" and not isinstance(value, str):
+        value = raw
+    try:
+        return check_value(setting.name, setting.type, value)
+    except ValueError as e:
+        raise SettingError(str(e)) from None
 
 
 def toml_value(v: Any) -> str:
@@ -154,17 +140,31 @@ def split_assignments(words: list[str]) -> list[tuple[str, str | None]]:
     return out
 
 
-def read_file(path: Path) -> tuple[str, Config, str | None]:
-    """(file text, loaded config, problem with it if it doesn't load)."""
-    if not path.exists():
-        return "", Config(), None
-    text = read_text_any(path)
+def load_text(text: str) -> tuple[Config, list[str], bool]:
+    """(the config with every setting that loads applied, what's wrong with the others,
+    whether the text is valid TOML at all)."""
     cfg = Config()
     try:
-        _apply(cfg, tomllib.loads(text), "")
-    except (tomllib.TOMLDecodeError, ValueError) as e:
-        return text, Config(), str(e)
-    return text, cfg, None
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        return cfg, [f"it isn't valid TOML ({e})"], False
+    problems = []
+    for key, value in data.items():
+        parts = value.items() if isinstance(value, dict) and is_dataclass(getattr(cfg, key, None)) else None
+        for one in ([{key: value}] if parts is None else [{key: {k: v}} for k, v in parts]):
+            try:
+                _apply(cfg, one, "")
+            except ValueError as e:
+                problems.append(str(e))
+    return cfg, problems, True
+
+
+def read_file(path: Path) -> tuple[str, Config, list[str], bool]:
+    """(file text, then load_text's results; an absent file is empty and all defaults)."""
+    if not path.exists():
+        return "", Config(), [], True
+    text = read_text_any(path)
+    return (text, *load_text(text))
 
 
 def _comment_col(line: str) -> int | None:
@@ -199,6 +199,17 @@ def _spans(lines: list[str]) -> dict[str | None, tuple[int, int]]:
     return spans
 
 
+def _value_end(lines: list[str], start: int) -> int | None:
+    """The last line of the setting that starts at `start` (a list can span several lines)."""
+    for end in range(start, min(len(lines), start + 200)):
+        try:
+            tomllib.loads("\n".join(lines[start:end + 1]))
+            return end
+        except tomllib.TOMLDecodeError:
+            continue
+    return None
+
+
 def edit_text(text: str, changes: list[tuple[Setting, Any]]) -> str:
     """Apply changes ((setting, value or None for the default)) to a TOML text."""
     lines = text.split("\n")
@@ -209,27 +220,29 @@ def edit_text(text: str, changes: list[tuple[Setting, Any]]) -> str:
         span = spans.get(setting.section)
         key = re.compile(rf"^\s*{re.escape(setting.key)}\s*=")
         idx = next((i for i in range(*span) if key.match(lines[i])), None) if span else None
+        end = _value_end(lines, idx) if idx is not None else None
+        if idx is not None and end is None:
+            continue  # can't tell where its value ends: the check after the edit refuses it
         if value is None:
             if idx is not None:
-                del lines[idx]
+                del lines[idx:end + 1]
             continue
         new = f"{setting.key} = {toml_value(value)}"
         if idx is not None:
             old = lines[idx]
             indent = old[:len(old) - len(old.lstrip())]
-            col = _comment_col(old)
+            col = _comment_col(old) if end == idx else None
             if col is not None:
                 new = (indent + new).ljust(col) if len(indent + new) < col else indent + new + "  "
-                lines[idx] = new + old[col:]
+                lines[idx:end + 1] = [new + old[col:]]
             else:
-                lines[idx] = indent + new
+                lines[idx:end + 1] = [indent + new]
         elif span is not None:
-            settings_lines = [i for i in range(*span) if _KEY_LINE.match(lines[i])]
-            if settings_lines:
-                at = settings_lines[-1] + 1
+            content = [i for i in range(*span) if lines[i].strip() and not lines[i].lstrip().startswith("#")]
+            if content:  # after the section's last setting (all of it, when its value spans lines)
+                at = content[-1] + 1
             elif setting.section is None:  # after the comments at the top of the file
-                at = next((i for i in range(*span) if lines[i].strip() and not lines[i].lstrip().startswith("#")),
-                          span[1])
+                at = span[1]
                 while at > 0 and not lines[at - 1].strip():
                     at -= 1
             else:
@@ -240,33 +253,72 @@ def edit_text(text: str, changes: list[tuple[Setting, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _changes(words: list[str]) -> list[tuple[Setting, Any]]:
+    pairs = split_assignments(words)
+    for n, (name, value) in enumerate(pairs):
+        if value is not None:
+            continue
+        nxt = pairs[n + 1] if n + 1 < len(pairs) else None
+        if name in sections() and nxt is not None and nxt[1] is not None and "." not in nxt[0]:
+            raise SettingError(f"write the section and the setting together: {name}.{nxt[0]}={nxt[1]}")
+        if not _is_setting(name):
+            prev = next((k for k in range(n - 1, -1, -1) if pairs[k][1] is not None), None)
+            if prev is not None:
+                words_after = []
+                for word, v in pairs[prev + 1:]:
+                    if v is not None or _is_setting(word):
+                        break
+                    words_after.append(word)
+                p_name, p_value = pairs[prev]
+                raise SettingError(f"'{name}' looks like part of the value of {p_name}: put quotes around a "
+                                   f"value with spaces, e.g. {p_name}='{' '.join([p_value, *words_after])}'")
+            resolve(name)  # raises: no such setting
+        s = resolve(name)
+        raise SettingError(f"give {s.name} a value, e.g. {s.name}=... (or {s.name}=default to go back to the default)")
+    changes = [(resolve(name), raw) for name, raw in pairs]
+    seen: dict[str, str] = {}
+    for s, raw in changes:
+        if s.name in seen:
+            raise SettingError(f"{s.name} is given twice ({seen[s.name]} and {raw}); give it once")
+        seen[s.name] = raw
+    return [(s, parse_value(s, raw)) for s, raw in changes]
+
+
 def change(path: Path, words: list[str]) -> list[str]:
     """Apply `section.key=value` words to the file. Returns lines describing what changed."""
-    pairs = split_assignments(words)
-    missing = [name for name, value in pairs if value is None]
-    if missing:
-        raise SettingError(f"give {missing[0]} a value, e.g. {resolve(missing[0]).name}=... "
-                           "(or =default to go back to the default)")
-    changes = [(s, parse_value(s, raw)) for s, raw in ((resolve(name), raw) for name, raw in pairs)]
-    text, before, problem = read_file(path)
-    if problem:
-        raise SettingError(f"{path} doesn't load ({problem}); fix that line by hand first")
+    changes = _changes(words)
+    text, before, problems, readable = read_file(path)
+    if not readable:
+        raise SettingError(f"{path} can't be read: {problems[0]}. Fix that line in a text editor first")
+    if "�" in text:
+        raise SettingError(f"{path} has characters that couldn't be read; save it as UTF-8 in your text editor "
+                           "first, so changing it doesn't damage them")
     if not text:
         text = ("# TRENCHNET settings. Every key is optional; anything not here uses its default.\n"
                 "# Change settings with: trenchnet config section.key=value\n")
     new_text = edit_text(text, changes)
-    after = Config()
-    try:
-        _apply(after, tomllib.loads(new_text), "")
-    except (tomllib.TOMLDecodeError, ValueError) as e:
-        raise SettingError(f"couldn't edit {path} automatically ({e}); nothing was changed. "
-                           "Edit it in a text editor instead.") from e
-    for s, value in changes:  # e.g. a value spread over several lines that the edit couldn't replace
+    after, new_problems, readable = load_text(new_text)
+    if not readable:
+        raise SettingError(f"couldn't edit {path} automatically; nothing was changed. "
+                           "Edit it in a text editor instead.")
+    caused = [q for q in new_problems if q not in problems]
+    if caused:
+        raise SettingError(f"couldn't edit {path} automatically ({caused[0]}); nothing was changed. "
+                           "Edit it in a text editor instead.")
+    if new_problems:
+        raise SettingError(f"{path}: {new_problems[0]}. Fix that line in a text editor first (nothing was changed)")
+    for s, value in changes:  # e.g. a "[section]" line inside a multi-line string, which isn't a section
         expected = s.default if value is None else value
         if s.value_in(after) != expected:
             raise SettingError(f"couldn't edit {s.name} in {path} automatically; nothing was changed. "
                                "Edit it in a text editor instead.")
-    path.write_text(new_text, encoding="utf-8")
+    # Written next to it, then swapped in: a failed write (full disk) leaves the old file as it was.
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     out = []
     for s, value in changes:
         old, new = s.value_in(before), s.value_in(after)
@@ -278,10 +330,11 @@ def change(path: Path, words: list[str]) -> list[str]:
 
 def describe(path: Path, words: list[str]) -> list[str]:
     """What `trenchnet config [section | section.key ...]` prints."""
-    text, cfg, problem = read_file(path)
-    out = []
-    if problem:
-        out.append(f"! {path} doesn't load ({problem}); the bot would stop at startup. Fix that line by hand.")
+    text, cfg, problems, readable = read_file(path)
+    out = [f"! {path}: {p}" for p in problems]
+    if problems:
+        out.append("  the bot won't start until that's fixed; "
+                   + ("the values below are the defaults" if not readable else "other settings are shown as loaded"))
     known = all_settings()
     if not words:
         where = f"settings file: {path.resolve()}" if path.exists() else \
@@ -293,19 +346,23 @@ def describe(path: Path, words: list[str]) -> list[str]:
             width = max(len(f"{s.name} = {toml_value(s.value_in(cfg))}") for s in changed)
             out += [f"  {f'{s.name} = {toml_value(s.value_in(cfg))}':<{width}}   (default: {toml_value(s.default)})"
                     for s in changed]
-        elif path.exists():
+        elif path.exists() and not problems:
             out.append("every setting is the default")
         out += ["",
                 "see a section:  trenchnet config " + " | ".join(sections()),
                 "change:         trenchnet config strategy.min_tracked_buyers=2",
                 "undo a change:  trenchnet config strategy.min_tracked_buyers=default"]
         return out
+    previous: Setting | None = None
     for word in words:
         if word in sections():
             out.append(f"[{word}]")
             rows = [(s.key, s) for s in known.values() if s.section == word]
+            previous = None
         else:
-            s = resolve(word)
+            if previous is not None and not _is_setting(word):
+                raise SettingError(f"to change {previous.name}, write {previous.name}={word}")
+            s = previous = resolve(word)
             rows = [(s.name, s)]
         width = max(len(label) for label, _ in rows)
         for label, s in rows:

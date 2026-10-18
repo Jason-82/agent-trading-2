@@ -799,7 +799,7 @@ def _entry_rules(cfg: Config, engine: Engine) -> str:
 
 
 async def cmd_config(args, cfg: Config | None) -> None:
-    path = Path(args.config or "trenchnet.toml")
+    path = Path(getattr(args, "config", None) or "trenchnet.toml")
     try:
         if any("=" in w for w in args.settings):
             for line in change(path, args.settings):
@@ -893,14 +893,15 @@ def _utf8_output() -> None:
 def main(argv: list[str] | None = None) -> None:
     _utf8_output()
     load_env_file(".env")  # keys saved in the project folder: no `source .env` needed
-    # --db works before or after the command name (`trenchnet --db x.db pnl` or `trenchnet pnl --db x.db`).
+    # --db and --config work before or after the command name (`trenchnet --db x.db pnl` or `trenchnet pnl --db x.db`).
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", dest="db_path", default=argparse.SUPPRESS, metavar="FILE",
                         help="SQLite database file (default: db_path in trenchnet.toml, i.e. trenchnet.db; "
                              "the demo uses memory unless this is given)")
+    common.add_argument("--config", default=argparse.SUPPRESS, metavar="FILE",
+                        help="settings file (default: trenchnet.toml in this folder)")
     p = argparse.ArgumentParser(prog="trenchnet", description=__doc__, parents=[common],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", help="path to trenchnet.toml")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -1002,11 +1003,12 @@ def main(argv: list[str] | None = None) -> None:
             handler.formatter.converter = time.gmtime  # the same clock as the trade lines
     for noisy in ("httpx", "httpcore"):  # their INFO lines include request URLs, i.e. the RPC API key
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    config_path = getattr(args, "config", None)
     try:
-        cfg = load_config(args.config)
-    except (OSError, ValueError) as e:  # ValueError includes TOML syntax errors and unknown keys
+        cfg = load_config(config_path)
+    except (OSError, ValueError) as e:  # ValueError: TOML syntax, unknown keys, values of the wrong kind
         if args.fn is not cmd_config:  # `trenchnet config` shows the problem itself
-            sys.exit(f"{args.config or 'trenchnet.toml'}: {e}")
+            sys.exit(f"{config_path or 'trenchnet.toml'}: {e}\n(see what's wrong with: trenchnet config)")
         cfg = Config()
     if getattr(args, "db_path", None):
         cfg.db_path = args.db_path

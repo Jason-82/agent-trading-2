@@ -176,7 +176,9 @@ class Strategy:
             head = (f"conviction: {tw.alias} bought {t.sol_amount:.2f} SOL, "
                     f"{ratio:.1f}x its usual {tw.typical_entry_sol:.2f} SOL entry")
             p = ledger.get(t.wallet, case.mint)
-            sold_since = any(e.wallet == t.wallet and e.side is Side.SELL for e in case.events[i + 1:])
+            # A sale stamped at or after the buy counts even if it arrived first (two live sources).
+            sold_since = any(e.wallet == t.wallet and e.side is Side.SELL and (j > i or e.ts >= t.ts)
+                             for j, e in enumerate(case.events) if j != i)
             # A position the wallet has left since (first_buy_ts restarts with each new position) or
             # sold from at all since the big buy isn't followed: the bot would buy into its exit.
             if (p is None or not p.is_open or sold_since or p.first_buy_ts is None or t.ts < p.first_buy_ts
@@ -192,7 +194,7 @@ class Strategy:
             reasons = [head, f"its record: {s['realized_pnl_sol']:.1f} SOL realized, win rate {s['win_rate']:.0%}"]
             if run_up is not None:
                 reasons.append(f"price {run_up:.2f}x its buy")
-            reasons.append(f"following {t.wallet}")  # the address, read back after a restart
+            reasons.append(f"following {t.wallet} (buy {t.signature})")  # read back after a restart
             return t.wallet, reasons
         return None, blocked[:1]
 

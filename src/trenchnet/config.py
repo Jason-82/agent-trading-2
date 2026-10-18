@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import tomllib
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -128,6 +130,59 @@ class Config:
     pumpportal: PumpPortalConfig = field(default_factory=PumpPortalConfig)
 
 
+# Settings that are fractions from 0 to 1 (0.35 = 35%), besides the *_fraction, *_share and *win_rate ones.
+_FRACTIONS = {"stop_loss_pct", "trailing_stop_pct", "min_confidence", "min_jaccard"}
+
+
+def is_fraction(key: str) -> bool:
+    return key in _FRACTIONS or key.endswith(("_fraction", "_share", "win_rate"))
+
+
+def _show(value: Any) -> str:
+    return json.dumps(value) if isinstance(value, str) else repr(value).lower() if isinstance(value, bool) else str(value)
+
+
+def check_value(name: str, kind: str, value: Any) -> Any:
+    """A setting's value from trenchnet.toml or `trenchnet config`, checked against its
+    type (the dataclass annotation, e.g. "float | None"). Raises ValueError saying what's wrong."""
+    kind = kind.replace(" | None", "").strip()
+    number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    quoted = " (remove the quotes)" if isinstance(value, str) else ""
+    if kind == "str":
+        if not isinstance(value, str):
+            raise ValueError(f"{name} must be text in quotes, not {_show(value)}")
+        return value
+    if kind == "bool":
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be true or false, not {_show(value)}"
+                             + (quoted if str(value).lower() in ("true", "false") else ""))
+        return value
+    if kind in ("int", "float"):
+        if not number or not math.isfinite(value):
+            looks_numeric = isinstance(value, str) and value.strip().replace(".", "", 1).isdigit()
+            raise ValueError(f"{name} must be a number, not {_show(value)}" + (quoted if looks_numeric else ""))
+        if value < 0:
+            raise ValueError(f"{name} can't be negative")
+        if kind == "int":
+            if value != int(value):
+                raise ValueError(f"{name} must be a whole number, not {value}")
+            value = int(value)
+        if is_fraction(name.rpartition(".")[2]) and value > 1:
+            raise ValueError(f"{name} is a fraction from 0 to 1, so {value:g} would mean {value * 100:g}%; "
+                             f"for {value:g}% use {value / 100:g}")
+        return value
+    if kind == "list[list[float]]":
+        def pair(p: Any) -> bool:
+            return (isinstance(p, list) and len(p) == 2
+                    and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in p)
+                    and p[0] > 0 and 0 < p[1] <= 1)
+        if not (isinstance(value, list) and all(pair(p) for p in value)):
+            raise ValueError(f"{name} must be a list of [multiple of the entry price, fraction to sell] pairs, "
+                             f"fractions from 0 to 1, e.g. {name}='[[2.0, 0.5], [4.0, 0.25]]'")
+        return value
+    return value
+
+
 def _apply(obj: Any, data: dict[str, Any], path: str) -> None:
     names = {f.name: f for f in fields(obj)}
     for key, value in data.items():
@@ -139,7 +194,7 @@ def _apply(obj: Any, data: dict[str, Any], path: str) -> None:
                 raise ValueError(f"config section {path}{key} must be a table")
             _apply(current, value, f"{path}{key}.")
         else:
-            setattr(obj, key, value)
+            setattr(obj, key, check_value(f"{path}{key}", str(names[key].type), value))
 
 
 def load_config(path: str | Path | None = None) -> Config:

@@ -151,8 +151,12 @@ trenchnet config strategy.min_tracked_buyers=default   # back to the default
 ```
 
 It keeps the file's comments, refuses typos and values of the wrong kind,
-and never saves a file that wouldn't load. Restart `trenchnet run` after a
-change.
+and never saves a file that wouldn't load. Shares and percentages such as
+`stop_loss_pct` are fractions: `0.35` means 35%. Put quotes around a value
+with spaces: `trenchnet config strategy.take_profit='[[2.0, 0.5], [4.0, 0.25]]'`.
+Restart `trenchnet run` after a change. If you edit the file by hand and
+get something wrong, the bot says what and where when it starts, and so
+does `trenchnet config`.
 
 ### When the bot buys
 
@@ -169,9 +173,10 @@ change.
   `conviction_min_win_rate` of 50%) buys `conviction_size_multiple` (3) times
   its usual entry or more, and still holds. The bot follows within
   `conviction_max_delay_s` (5 min) of that buy, if the price is under
-  `max_run_up` times what the wallet paid. Such a position is sold when
-  *that* wallet sells half its tokens or no longer holds the token (other
-  wallets' trades don't count), besides the price and time exits. `trenchnet run`
+  `max_run_up` times what the wallet paid, and not if the wallet has sold any
+  of it since. Such a position is sold when *that* wallet sells half its
+  tokens, no longer holds the token, or leaves that position and buys again
+  (other wallets' trades don't count), besides the price and time exits. `trenchnet run`
   lists which followed wallets qualify when it starts. It copies a single
   wallet, so it is riskier than confluence: the big buy can be bait, or the
   wallet may be about to sell into the followers.
