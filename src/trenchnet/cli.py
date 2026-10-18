@@ -12,6 +12,7 @@
     trenchnet run --live               # live data, real orders (see README first)
     trenchnet reports [--mint MINT]    # situation reports
     trenchnet pnl [--since 7d]         # profit and loss from the bot's trades
+    trenchnet config [section.key=value]  # show or change settings in trenchnet.toml
 
 Every command takes --db FILE to use a database other than trenchnet.db.
 """
@@ -44,6 +45,7 @@ from .llm import LLM
 from .models import short
 from .profiler import build_roster
 from .reporter import Reporter, format_report
+from .settings import SettingError, change, describe
 from .store import Store
 from .envfile import load_env_file
 from .textfile import read_text_any
@@ -670,6 +672,7 @@ async def cmd_run(args, cfg: Config) -> None:
                     background_reports=cfg.llm.background_reports,
                     on_hold=lambda m: source.watch_tokens([m]), on_release=lambda m: source.unwatch_tokens([m]))
     print(f"following {len(tracked)} wallets: {', '.join(t.alias for t in tracked.values())}")
+    print(_entry_rules(cfg, engine))
 
     # Pick up where the last run left off: holdings, traded tokens, today's PnL.
     engine.restore(store.fills(mode=broker.mode))
@@ -778,6 +781,37 @@ def _age(seconds: float) -> str:
         if seconds >= n:
             return f"{seconds / n:.0f}{unit}"
     return f"{seconds:.0f}s"
+
+
+def _entry_rules(cfg: Config, engine: Engine) -> str:
+    c = cfg.strategy
+    if not c.enabled:
+        return "trading rules are off ([strategy] enabled = false): reports only"
+    line = (f"buys when {c.min_tracked_buyers}+ followed wallets buy within {c.entry_window_s / 60:.0f} min"
+            + (f" (from {c.min_independent_clusters}+ separate groups)" if c.min_independent_clusters > 1 else ""))
+    if c.conviction_entry:
+        strong = [t.alias for t in engine.tracked.values() if engine.strategy.strong_record(t)]
+        who = strong[0] if len(strong) == 1 else "one of " + ", ".join(strong)
+        line += (f", or when {who} buys {c.conviction_size_multiple:g}x its usual entry or more" if strong else
+                 f"; conviction buys are on, but no followed wallet has the record for them "
+                 f"({c.conviction_min_realized_sol:g}+ SOL realized and a {c.conviction_min_win_rate:.0%}+ win rate)")
+    return line
+
+
+async def cmd_config(args, cfg: Config | None) -> None:
+    path = Path(args.config or "trenchnet.toml")
+    try:
+        if any("=" in w for w in args.settings):
+            for line in change(path, args.settings):
+                print(line)
+            print(f"saved {path.resolve()}; restart `trenchnet run` to use it")
+        else:
+            for line in describe(path, args.settings):
+                print(line)
+    except SettingError as e:
+        sys.exit(f"trenchnet config: {e}")
+    except OSError as e:
+        sys.exit(f"trenchnet config: can't use {path}: {e.strerror or e}")
 
 
 async def cmd_reports(args, cfg: Config) -> None:
@@ -953,6 +987,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_pnl)
 
+    s = command("config", help="show or change settings in trenchnet.toml")
+    s.add_argument("settings", nargs="*", metavar="SETTING",
+                   help="a section (strategy), a setting (strategy.min_tracked_buyers), "
+                        "or section.key=value to change it (=default undoes a change)")
+    s.set_defaults(fn=cmd_config)
+
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="[%(asctime)s UTC] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -962,7 +1002,12 @@ def main(argv: list[str] | None = None) -> None:
             handler.formatter.converter = time.gmtime  # the same clock as the trade lines
     for noisy in ("httpx", "httpcore"):  # their INFO lines include request URLs, i.e. the RPC API key
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except (OSError, ValueError) as e:  # ValueError includes TOML syntax errors and unknown keys
+        if args.fn is not cmd_config:  # `trenchnet config` shows the problem itself
+            sys.exit(f"{args.config or 'trenchnet.toml'}: {e}")
+        cfg = Config()
     if getattr(args, "db_path", None):
         cfg.db_path = args.db_path
     try:

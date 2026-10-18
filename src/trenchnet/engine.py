@@ -34,6 +34,7 @@ from .strategy import Order, Strategy
 log = logging.getLogger(__name__)
 
 _TP_REASON = re.compile(r"^take-profit (\d+):")
+_CONVICTION_REASON = re.compile(r"^conviction: (.+?) bought ")
 
 
 def tracked_from_roster(roster: list[dict]) -> dict[str, TrackedWallet]:
@@ -90,10 +91,16 @@ class Engine:
         """Rebuild the bot's holdings from stored fills after a restart, and
         reopen a case for each token still held so exits keep running."""
         names = {f.name for f in fields(Fill)}
+        by_alias = {tw.alias: w for w, tw in self.tracked.items()}
         for row in fills:
             fill = Fill(**{k: row[k] for k in names})
             m = _TP_REASON.match(fill.reason) if fill.side == "sell" else None
-            self.portfolio.apply(fill, tp_index=int(m.group(1)) - 1 if m else None)
+            c = _CONVICTION_REASON.match(fill.reason) if fill.side == "buy" else None
+            leader = by_alias.get(c.group(1)) if c else None
+            if c and leader is None:
+                log.warning("%s was bought following %s, who is no longer followed; it now follows "
+                            "the token's followed buyers out", short(fill.mint), c.group(1))
+            self.portfolio.apply(fill, tp_index=int(m.group(1)) - 1 if m else None, leader=leader)
         for mint, h in self.portfolio.holdings.items():
             case = self.cases[mint] = Case(mint=mint, opened_ts=h.entry_ts)
             for t in self.store.trades(wallets=list(self.tracked_set), mint=mint):
@@ -177,13 +184,13 @@ class Engine:
         if lock.locked():
             return  # an order for this token is in flight; the next event re-evaluates
         async with lock:
-            order, reasons = self.strategy.entry(case, self.ledger, self.tracked_set, rel, self.now)
+            order, reasons = self.strategy.entry(case, self.ledger, self.tracked_set, rel, self.now, self.tracked)
             if order is not None:
                 await self._execute(order)
         if (order is None and reasons and reasons[0] not in ("already holding", "already traded this token")
                 and self.skips.get(case.mint) != reasons[0]):
             self.skips[case.mint] = reasons[0]
-            if len(case.buyers()) >= 2:
+            if len(case.buyers()) >= 2 or reasons[0].startswith("conviction"):
                 self.out(f"    no entry: {reasons[0]}")
         await self._exits(case)
 
@@ -266,7 +273,7 @@ class Engine:
         if lock.locked():
             return  # an order for this token is in flight; the next event or tick re-evaluates
         async with lock:
-            for order in self.strategy.exits(case, self.ledger, self.tracked_set, self.now):
+            for order in self.strategy.exits(case, self.ledger, self.tracked_set, self.now, self.tracked):
                 await self._execute(order)
 
     async def _execute(self, order: Order) -> None:
@@ -280,7 +287,7 @@ class Engine:
         if fill is None:
             self.out(f"    ✗ {order.side} {short(order.mint)} not filled ({order.reason})")
             return
-        pnl = self.portfolio.apply(fill, tp_index=order.tp_index)
+        pnl = self.portfolio.apply(fill, tp_index=order.tp_index, leader=order.leader)
         self.store.add_fill(mint=fill.mint, side=fill.side, sol_amount=fill.sol_amount,
                             token_amount=fill.token_amount, price_sol=fill.price_sol, fee_sol=fill.fee_sol,
                             ts=fill.ts, mode=fill.mode, reason=fill.reason, tx_signature=fill.tx_signature)

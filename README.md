@@ -137,7 +137,47 @@ Everything the bot records (trades, roster, reports, its own fills) is in
 `trenchnet.db` in the folder you run it from. Every command accepts
 `--db FILE` to use a different file.
 
-Configuration lives in `trenchnet.toml` (copy `examples/trenchnet.example.toml`).
+## Settings
+
+Settings live in `trenchnet.toml` in the folder you run the bot from (all
+of them, with their defaults and what they do:
+`examples/trenchnet.example.toml`). Change them without opening the file:
+
+```bash
+trenchnet config                                   # what you've changed from the defaults
+trenchnet config strategy                          # every setting in a section
+trenchnet config strategy.min_tracked_buyers=2     # change one (creates the file if needed)
+trenchnet config strategy.min_tracked_buyers=default   # back to the default
+```
+
+It keeps the file's comments, refuses typos and values of the wrong kind,
+and never saves a file that wouldn't load. Restart `trenchnet run` after a
+change.
+
+### When the bot buys
+
+- **Confluence** (always on): `min_tracked_buyers` followed wallets (3 by
+  default) bought within `entry_window_s` (15 min) and still hold, from at
+  least `min_independent_clusters` separate groups (2: wallets that always
+  buy together count as one), with the price under `max_run_up` times the
+  first followed buy. The position is sold when those wallets have sold
+  half their tokens or the first of them leaves, besides the stop-loss,
+  take-profit, trailing stop and maximum hold.
+- **Conviction buys** (off until `trenchnet config strategy.conviction_entry=true`):
+  one followed wallet with a strong record (at least
+  `conviction_min_realized_sol`, 20 SOL, realized and a
+  `conviction_min_win_rate` of 50%) buys `conviction_size_multiple` (3) times
+  its usual entry or more, and still holds. The bot follows within
+  `conviction_max_delay_s` (5 min) of that buy, if the price is under
+  `max_run_up` times what the wallet paid. Such a position is sold when
+  *that* wallet sells half its tokens or no longer holds the token (other
+  wallets' trades don't count), besides the price and time exits. `trenchnet run`
+  lists which followed wallets qualify when it starts. It copies a single
+  wallet, so it is riskier than confluence: the big buy can be bait, or the
+  wallet may be about to sell into the followers.
+
+Both share the size and risk limits (`position_size_sol`,
+`max_open_positions`, `max_total_exposure_sol`, `daily_loss_limit_sol`).
 
 ## Fomo traders
 
@@ -195,7 +235,8 @@ Use a fresh wallet holding only what you are prepared to lose.
   are sometimes used to bait followers into buying before they sell. The
   graph's "recurring group" signal describes co-trading, not ownership — a
   cluster could be one operator. That is why entries require at least two
-  independent clusters by default.
+  independent clusters by default, and why conviction buys are off unless
+  you turn them on.
 - **Past profitability is weak evidence** for memecoins: survivorship,
   one-off winners and unrealized gains all flatter a wallet. The selection
   criteria and profiles try to expose this; they cannot remove it.
@@ -232,6 +273,6 @@ src/trenchnet/
   prices.py fomo.py                   SOL/USD history, Fomo trader discovery
   brokers/  paper.py pumpportal.py    execution
   sources/  pumpportal_ws.py rpc_ws.py rpc_backfill.py replay.py synthetic.py
-  llm.py solana_rpc.py store.py config.py cli.py
+  llm.py solana_rpc.py store.py config.py settings.py cli.py
 tests/                                offline tests (fake LLM client, local websocket)
 ```

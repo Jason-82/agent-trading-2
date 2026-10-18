@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .stats import SelectionCriteria
+from .textfile import read_text_any
 
 
 @dataclass
@@ -59,6 +60,15 @@ class StrategyConfig:
     max_run_up: float = 3.0  # skip if price > N x the first tracked entry price
     min_market_cap_sol: float | None = None
     max_market_cap_sol: float | None = None
+    # Entry: a conviction buy, i.e. one followed wallet with a strong record buying far more than
+    # it usually does. Off by default: it copies a single wallet, without the confluence checks above.
+    # Such a position is sold when that wallet sells (exit_on_cohort_sold_fraction of its tokens) or
+    # no longer holds the token, besides the price and time exits.
+    conviction_entry: bool = False
+    conviction_size_multiple: float = 3.0  # the buy is at least this many times its median entry
+    conviction_min_realized_sol: float = 20.0  # the wallet's realized profit in its history
+    conviction_min_win_rate: float = 0.5
+    conviction_max_delay_s: float = 300.0  # follow within this long of its buy, or not at all
     # Sizing and risk.
     position_size_sol: float = 0.1
     max_open_positions: int = 5
@@ -139,6 +149,5 @@ def load_config(path: str | Path | None = None) -> Config:
         if not default.exists():
             return cfg
         path = default
-    with open(path, "rb") as f:
-        _apply(cfg, tomllib.load(f), "")
+    _apply(cfg, tomllib.loads(read_text_any(path)), "")  # also a file Notepad saved with a BOM or as UTF-16
     return cfg
