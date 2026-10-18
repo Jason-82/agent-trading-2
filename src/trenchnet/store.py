@@ -142,9 +142,9 @@ class Store:
                        source: str = "rpc", order: dict[str, int] | None = None) -> tuple[int, int]:
         """Save a fresh reading of some of a wallet's transactions, in one
         database transaction. It replaces this source's earlier reading of
-        those signatures, and any copy of the same trade from another source
-        (a trade seen live is stored again with its on-chain time). Other rows
-        (older history, other trades seen live) are kept.
+        those signatures, and any other source's copy of a trade it read (a
+        trade seen live is stored again with its on-chain time and reading).
+        Other rows (older history, other trades seen live) are kept.
 
         Trades in the same second replay in the order they are stored, so every
         second this touches is rewritten in on-chain order: `order` gives each
@@ -175,8 +175,12 @@ class Store:
                     f"SELECT * FROM trades WHERE wallet = ? AND signature IN ({','.join('?' * len(chunk))})",
                     [wallet, *chunk])]
 
+            # The chain reading of a transaction wins over another source's copy of the same trade,
+            # even one that read it differently (e.g. spam a live feed reported as a buy for nothing).
+            same_trade = {(t.signature, t.mint) for t in trades}
+
             def replaced(t: Trade) -> bool:
-                return (t.source == source and t.signature in read) or t.key in new_by_key
+                return (t.source == source and t.signature in read) or (t.signature, t.mint) in same_trade
 
             ours = {t.key for t in old if t.source == source}
             touched = {t.ts for t in old if replaced(t)} | {t.ts for t in trades}

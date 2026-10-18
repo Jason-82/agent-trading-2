@@ -16,16 +16,16 @@ import asyncio
 import logging
 import re
 import sqlite3
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import Awaitable, Callable, Iterable
 
 from .brokers.base import Broker, Fill
 from .cases import Case, TrackedWallet, build_snapshot, iso
 from .config import Config
 from .graph import TradeGraph
-from .judge import Judge, route
+from .judge import Judge, RouteDecision, route
 from .ledger import Ledger
-from .models import PriceTick, Trade, short
+from .models import PriceTick, Side, Trade, short
 from .portfolio import Portfolio
 from .reporter import Reporter, format_report
 from .store import Store
@@ -118,6 +118,10 @@ class Engine:
             await self._exits(case)
 
     async def on_trade(self, t: Trade) -> None:
+        dust = self.cfg.strategy.dust_sol
+        if t.side is Side.BUY and t.sol_amount < dust:
+            # Tokens pushed into the wallet for next to nothing (spam dressed up as a buy): not a trade.
+            t = replace(t, side=Side.TRANSFER_IN, sol_amount=0.0, price_sol=None)
         if t.key in self.seen:
             return
         self.seen.add(t.key)
@@ -131,6 +135,13 @@ class Engine:
                 await self._exits(case)
             return
 
+        if not t.side.is_trade or (t.side is Side.SELL and t.sol_amount < dust and case is None):
+            # Transfers, and old leftovers sold for nothing in a token the bot isn't following:
+            # keep the wallet's position right, but there's nothing to judge or report.
+            self.ledger.apply(t)
+            self.graph.add_trade(t)
+            return
+
         self.ledger.apply(t)
         self.graph.add_trade(t)
         if case is None:
@@ -141,6 +152,8 @@ class Engine:
         snap = build_snapshot(case, t, self.ledger, self.tracked, rel, self.now)
         assessment, source = await self.judge.assess(snap)
         decision = route(snap, assessment, self.cfg.router)
+        if decision.route == "analyze" and not self._report_due(case, t):
+            decision = RouteDecision("observe", decision.reasons + ["no new wallet since the last report"])
         a = assessment.model_dump()
         case.assessments.append({
             "ref": snap["event"]["ref"], "alias": self.name(t.wallet), "wallet": t.wallet,
@@ -196,10 +209,25 @@ class Engine:
 
     # -- reports ----------------------------------------------------------
 
+    def _participants(self, mint: str) -> tuple[frozenset, int]:
+        """Followed wallets that traded the token, and how many still hold it."""
+        positions = {w: p for w, p in self.ledger.for_mint(mint).items() if w in self.tracked_set and p.traded}
+        return frozenset(positions), sum(1 for p in positions.values() if p.is_open)
+
+    def _report_due(self, case: Case, t: Trade) -> bool:
+        if case.last_report is None and not case.report_pending:
+            return True
+        wallets, holders = self._participants(case.mint)
+        if wallets - case.reported_wallets or (holders == 0 and case.reported_holders > 0):
+            return True  # a followed wallet joined, or the last one left
+        last_ts = case.last_report["ts"] if case.last_report else case.opened_ts
+        return t.ts - last_ts >= self.cfg.router.report_cooldown_s
+
     async def _report(self, case: Case, snap: dict, trigger: Trade) -> None:
         if case.report_pending:
             return
         case.report_pending = True
+        case.reported_wallets, case.reported_holders = self._participants(case.mint)
         if self.background_reports:
             task = asyncio.create_task(self._write_report(case, snap, trigger))
             self._tasks.add(task)

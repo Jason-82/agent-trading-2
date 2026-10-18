@@ -40,6 +40,9 @@ class GraphConfig:
 class RouterConfig:
     min_buyers_for_analysis: int = 2
     min_confidence: float = 0.55
+    # A token gets a new report when another followed wallet joins it or its last holder leaves;
+    # otherwise at most one per this many seconds (a wallet flipping in and out isn't news each time).
+    report_cooldown_s: float = 900.0
 
 
 @dataclass
@@ -69,6 +72,10 @@ class StrategyConfig:
     exit_on_cohort_sold_fraction: float = 0.5
     exit_on_leader_exit: bool = True
     reenter_same_mint: bool = False
+    # A "buy" for less than this is tokens pushed into the wallet by someone else (spam that shows
+    # up as a buy on trackers, often aimed at well-known wallets), not a trade. Sales for less than
+    # this of tokens the bot isn't following are clean-ups of old leftovers and are not shown.
+    dust_sol: float = 0.005
 
 
 @dataclass

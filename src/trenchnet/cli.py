@@ -955,9 +955,11 @@ def main(argv: list[str] | None = None) -> None:
 
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+                        format="[%(asctime)s UTC] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     for handler in logging.getLogger().handlers:
         handler.addFilter(_EndProgressLine())
+        if handler.formatter is not None:
+            handler.formatter.converter = time.gmtime  # the same clock as the trade lines
     for noisy in ("httpx", "httpcore"):  # their INFO lines include request URLs, i.e. the RPC API key
         logging.getLogger(noisy).setLevel(logging.WARNING)
     cfg = load_config(args.config)

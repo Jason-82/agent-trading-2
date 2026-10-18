@@ -60,6 +60,8 @@ class Case:
     assessments: list[dict] = field(default_factory=list)  # per event: signature, wallet, side, assessment, route
     last_report: dict | None = None  # {id, ts, headline, what_changed}
     report_pending: bool = False
+    reported_wallets: frozenset = frozenset()  # followed wallets in the token when it was last reported
+    reported_holders: int = 0  # how many of them still held it then
     _index: dict[tuple, int] = field(default_factory=dict, repr=False)
 
     def add_event(self, t: Trade) -> None:

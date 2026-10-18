@@ -32,6 +32,7 @@ min_history_tokens = 5
 [router]
 min_buyers_for_analysis = 2
 min_confidence = 0.55
+report_cooldown_s = 900             # a token's next report waits this long, unless a wallet joins or the last leaves
 
 [strategy]
 enabled = true
@@ -56,6 +57,7 @@ max_hold_s = 21600
 exit_on_cohort_sold_fraction = 0.5
 exit_on_leader_exit = true
 reenter_same_mint = false
+dust_sol = 0.005                    # "buys" below this are spam pushed into a wallet, not trades
 
 [paper]
 starting_balance_sol = 5.0
