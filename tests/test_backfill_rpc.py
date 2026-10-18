@@ -226,7 +226,7 @@ def test_cli_backfill_reports_a_rejected_key(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("trenchnet.solana_rpc.httpx.AsyncClient", client)
     with pytest.raises(SystemExit) as e:
         main(["backfill", str(wallets), "--db", str(tmp_path / "t.db"), "--rpc", "https://rpc.example/?api-key=K"])
-    assert "rejected the URL or API key" in str(e.value.code) and "source .env" in str(e.value.code)
+    assert "rejected the URL or API key" in str(e.value.code) and "in .env" in str(e.value.code)
     assert "Reading history from rpc.example" in capsys.readouterr().out
 
 

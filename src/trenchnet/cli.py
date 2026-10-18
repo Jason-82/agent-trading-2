@@ -45,6 +45,7 @@ from .models import short
 from .profiler import build_roster
 from .reporter import Reporter, format_report
 from .store import Store
+from .envfile import load_env_file
 from .textfile import read_text_any
 
 LIVE_ACK_ENV = "TRENCHNET_LIVE_ACK"
@@ -218,7 +219,7 @@ def _wallet_summary(res) -> str:
 
 _STOP_ADVICE = {
     "credentials": "The RPC rejected the URL or API key. Check SOLANA_RPC_URL (the full Helius URL including "
-                   "?api-key=...) and run `source .env`.",
+                   "?api-key=...) in .env.",
     "url": "Check SOLANA_RPC_URL: it should be the full https:// RPC URL from your Helius dashboard.",
     "quota": "Your RPC plan's credits are used up for now. Trades read so far are saved. Wait for the plan to reset "
              "(Helius: monthly), add credits, or use another RPC URL, then run the same command again.",
@@ -245,7 +246,7 @@ def _rpc_from(url: str, rps: float | None = None):
     try:
         return SolanaRpc(url, requests_per_second=rps)
     except ValueError as e:
-        sys.exit(f"SOLANA_RPC_URL problem: {e}. If you made .env in Notepad, re-save it and run `source .env`.")
+        sys.exit(f"SOLANA_RPC_URL problem: {e}. Check the SOLANA_RPC_URL line in .env.")
 
 
 async def cmd_backfill(args, cfg: Config) -> None:
@@ -258,7 +259,7 @@ async def cmd_backfill(args, cfg: Config) -> None:
     print(f"Reading history from {rpc.host}, up to {rpc.requests_per_second:g} requests/second.")
     if rpc.is_public:
         print("  This is Solana's free public RPC: slow and heavily rate limited. To use your Helius key,\n"
-              "  run `source .env` first (or set SOLANA_RPC_URL).", file=sys.stderr)
+              "  put SOLANA_RPC_URL in .env in this folder.", file=sys.stderr)
     store = Store(cfg.db_path)
     if args.new_only:
         have = store.wallet_trade_counts()
@@ -626,7 +627,7 @@ async def cmd_run(args, cfg: Config) -> None:
         print(f"also watching the wallets through {watcher.host} (sees trades PumpPortal doesn't report, "
               "such as Fomo trades)")
     elif not watch_url:
-        print("tip: set SOLANA_RPC_URL (your Helius URL) to also watch the wallets through your RPC; "
+        print("tip: put SOLANA_RPC_URL (your Helius URL) in .env to also watch the wallets through your RPC; "
               "trades made in the Fomo app are only seen that way", file=sys.stderr)
 
     stopping = False
@@ -857,6 +858,7 @@ def _utf8_output() -> None:
 
 def main(argv: list[str] | None = None) -> None:
     _utf8_output()
+    load_env_file(".env")  # keys saved in the project folder: no `source .env` needed
     # --db works before or after the command name (`trenchnet --db x.db pnl` or `trenchnet pnl --db x.db`).
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", dest="db_path", default=argparse.SUPPRESS, metavar="FILE",

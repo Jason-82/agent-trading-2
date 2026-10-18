@@ -66,6 +66,7 @@ class PumpPortalSource:
         self._ws = None
         self._stop = False
         self._stopped = asyncio.Event()
+        self._reported: set[str] = set()  # PumpPortal errors already explained (reconnects repeat them)
 
     @property
     def url(self) -> str:
@@ -98,6 +99,27 @@ class PumpPortalSource:
         if self._ws is not None:
             asyncio.get_running_loop().create_task(self._ws.close())
 
+    def _redact(self, text: str) -> str:
+        return text.replace(self.api_key, "<api key>") if self.api_key else text
+
+    def _report(self, error: object) -> None:
+        """Explain a PumpPortal error in plain words, once per kind."""
+        text = self._redact(str(error))
+        if text in self._reported:
+            return
+        self._reported.add(text)
+        low = text.lower()
+        if "balance" in low:
+            log.warning("PumpPortal: %s\n  The wallet linked to your PUMPPORTAL_API_KEY holds less than PumpPortal's "
+                        "minimum (0.02 SOL), so PumpPortal sends no trades or prices. Send about 0.05 SOL to that "
+                        "wallet (the walletPublicKey you saved when you created the key) and restart. Until then "
+                        "the bot only sees what your RPC reports (if SOLANA_RPC_URL is set).", text)
+        elif "key" in low or "auth" in low:
+            log.warning("PumpPortal: %s\n  Check PUMPPORTAL_API_KEY in .env: it should be the apiKey value PumpPortal "
+                        "gave you.", text)
+        else:
+            log.warning("PumpPortal: %s", text)
+
     async def events(self) -> AsyncIterator[Trade | PriceTick]:
         backoff = 1.0
         while not self._stop:
@@ -117,13 +139,13 @@ class PumpPortalSource:
                         if not isinstance(msg, dict):
                             continue
                         if "errors" in msg or "error" in msg:
-                            log.warning("pumpportal: %s", msg)
+                            self._report(msg.get("errors") or msg.get("error"))
                         for ev in parse_message(msg, self.tracked, time.time()):
                             yield ev
                         if self._stop:
                             return
             except (OSError, websockets.WebSocketException) as e:
-                log.warning("pumpportal connection lost (%s); reconnecting in %.0fs", e, backoff)
+                log.warning("pumpportal connection lost (%s); reconnecting in %.0fs", self._redact(str(e)), backoff)
             finally:
                 self._ws = None
             if not self._stop:

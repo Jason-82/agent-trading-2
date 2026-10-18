@@ -60,8 +60,11 @@ line) before running `trenchnet`. On Windows the command is `python`, not
 `python3`; if PowerShell refuses to run `Activate.ps1`, run
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.
 
-Setting keys: `export NAME="value"` in Git Bash, macOS or Linux;
-`$env:NAME = "value"` in PowerShell. They last until you close the terminal.
+Setting keys: put them in a file named `.env` in the project folder, one per
+line, e.g. `export SOLANA_RPC_URL="https://..."` (the `export` is optional).
+Every `trenchnet` command reads it, so there's nothing to load first; git never
+uploads it. A key set in the terminal (`export NAME="value"` in Git Bash,
+`$env:NAME = "value"` in PowerShell) takes precedence over the file.
 
 **Updating to a newer version:** stop any running `trenchnet run` first
 (Ctrl-C), then `git pull` and `pip install -e ".[dev]"`, then start it again.
