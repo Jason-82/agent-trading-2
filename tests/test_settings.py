@@ -120,6 +120,20 @@ def test_reads_a_windows_file(tmp_path):
 def test_spaces_around_the_equals_sign():
     assert split_assignments(["a.b", "=", "1", "c=", "2", "d", "=3", "e"]) == [
         ("a.b", "1"), ("c", "2"), ("d", "3"), ("e", None)]
+    # A value that ends in "=" (an API key in a URL) doesn't swallow the next setting.
+    assert split_assignments(["live.rpc_url=https://rpc.example/?api-key=abc=", "strategy.enabled=false"]) == [
+        ("live.rpc_url", "https://rpc.example/?api-key=abc="), ("strategy.enabled", "false")]
+    assert split_assignments(["live.rpc_url=", "https://rpc.example/?api-key=abc"]) == [
+        ("live.rpc_url", "https://rpc.example/?api-key=abc")]
+    assert split_assignments(["live.pool=", "strategy.enabled=false"]) == [
+        ("live.pool", ""), ("strategy.enabled", "false")]
+
+
+def test_an_empty_value_is_refused(tmp_path):
+    path = tmp_path / "trenchnet.toml"
+    with pytest.raises(SettingError, match="give live.pool a value"):
+        change(path, ["live.pool=", "strategy.enabled=false"])
+    assert not path.exists()
 
 
 def test_describe(tmp_path):

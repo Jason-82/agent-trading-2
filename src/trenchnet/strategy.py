@@ -32,6 +32,7 @@ class Order:
     token_amount: float = 0.0  # for sells
     tp_index: int | None = None
     leader: str | None = None  # conviction entries: the wallet the position follows out
+    leader_round: int | None = None  # ... and which of its positions in the token (Position.rounds)
 
 
 class Strategy:
@@ -93,7 +94,9 @@ class Strategy:
         size, blocked = self._size(case, now)
         if blocked:
             return None, [f"{reasons[0]}; not followed: {blocked}" if leader else blocked]
-        return Order(case.mint, "buy", price, "; ".join(reasons), sol_amount=size, leader=leader), reasons
+        lead = ledger.get(leader, case.mint) if leader else None
+        return Order(case.mint, "buy", price, "; ".join(reasons), sol_amount=size, leader=leader,
+                     leader_round=lead.rounds if lead else None), reasons
 
     def _size(self, case: Case, now: float) -> tuple[float, str | None]:
         """The position size, or what blocks any entry: market cap and risk limits."""
@@ -160,20 +163,25 @@ class Strategy:
         (None, why the biggest such buy isn't followed; empty if there was none)."""
         c = self.cfg
         big = []
-        for t in case.events:
+        for i, t in enumerate(case.events):
             tw = wallets.get(t.wallet)
             if (t.side is not Side.BUY or t.wallet not in tracked or tw is None or now - t.ts > c.conviction_max_delay_s
                     or not tw.typical_entry_sol or not self.strong_record(tw)):
                 continue
             ratio = t.sol_amount / tw.typical_entry_sol
             if ratio >= c.conviction_size_multiple:
-                big.append((ratio, t, tw))
+                big.append((ratio, i, t, tw))
         blocked = []
-        for ratio, t, tw in sorted(big, key=lambda b: b[0], reverse=True):
+        for ratio, i, t, tw in sorted(big, key=lambda b: b[0], reverse=True):
             head = (f"conviction: {tw.alias} bought {t.sol_amount:.2f} SOL, "
                     f"{ratio:.1f}x its usual {tw.typical_entry_sol:.2f} SOL entry")
             p = ledger.get(t.wallet, case.mint)
-            if p is None or not p.is_open or p.sold_fraction > 1 - c.min_active_holder_fraction:
+            sold_since = any(e.wallet == t.wallet and e.side is Side.SELL for e in case.events[i + 1:])
+            # A position the wallet has left since (first_buy_ts restarts with each new position) or
+            # sold from at all since the big buy isn't followed: the bot would buy into its exit.
+            if (p is None or not p.is_open or sold_since or p.first_buy_ts is None or t.ts < p.first_buy_ts
+                    or p.sold_fraction >= c.exit_on_cohort_sold_fraction
+                    or p.sold_fraction > 1 - c.min_active_holder_fraction):
                 blocked.append(f"{head}; not followed: it has sold since")
                 continue
             run_up = price / t.price if t.price else None
@@ -184,6 +192,7 @@ class Strategy:
             reasons = [head, f"its record: {s['realized_pnl_sol']:.1f} SOL realized, win rate {s['win_rate']:.0%}"]
             if run_up is not None:
                 reasons.append(f"price {run_up:.2f}x its buy")
+            reasons.append(f"following {t.wallet}")  # the address, read back after a restart
             return t.wallet, reasons
         return None, blocked[:1]
 
@@ -205,15 +214,17 @@ class Strategy:
             if h.tp_hit and price <= h.peak_price * (1 - c.trailing_stop_pct):
                 return full(f"trailing stop: {1 - price / h.peak_price:.0%} below peak")
 
-        if h.leader is not None:
+        lead = ledger.get(h.leader, case.mint) if h.leader is not None else None
+        if lead is not None:
             # A conviction entry follows the one wallet it copied, not the token's other buyers.
-            lead = ledger.get(h.leader, case.mint)
             who = wallets[h.leader].alias if wallets and h.leader in wallets else short(h.leader)
-            if lead is not None and lead.sold_fraction >= c.exit_on_cohort_sold_fraction:
+            if h.leader_round is not None and lead.rounds != h.leader_round:
+                return full(f"{who} has left the position the bot followed (and bought again since)")
+            if lead.sold_fraction >= c.exit_on_cohort_sold_fraction:
                 return full(f"{who} has sold {lead.sold_fraction:.0%} of its tokens")
-            if c.exit_on_leader_exit and lead is not None and not lead.is_open:
+            if c.exit_on_leader_exit and not lead.is_open:
                 return full(f"{who} no longer holds the token")
-        else:
+        else:  # a confluence entry, or a conviction entry whose wallet is no longer followed
             cohort = self.cohort(case, ledger, tracked)
             sold = self.cohort_sold_fraction(case, ledger, cohort)
             if cohort and sold >= c.exit_on_cohort_sold_fraction:

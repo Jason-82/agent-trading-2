@@ -128,18 +128,28 @@ def test_a_conviction_position_exits_when_its_wallet_moves_the_tokens_away():
     assert o.reason == "mitch no longer holds the token"
 
 
-def engine():
+def engine(records=RECORDS, history=(), **strategy):
     cfg = Config()
     cfg.llm.use_llm_profiles = cfg.llm.use_llm_judge = cfg.llm.use_llm_reports = False
     cfg.strategy.conviction_entry = True
+    for k, v in strategy.items():
+        setattr(cfg.strategy, k, v)
     store = Store()
-    for w, (alias, stats) in RECORDS.items():
+    for w, (alias, stats) in records.items():
         store.upsert_roster(wallet=w, alias=alias, included=True, score=1.0, reasons=[], stats=stats,
                             profile={"style": "patient_holder", "summary": "test"}, profile_source=None, ts=0)
     lines = []
     e = Engine(cfg, store, tracked_from_roster(store.roster()), HeuristicJudge(cfg), Reporter(cfg),
-               PaperBroker(cfg.paper), out=lines.append)
+               PaperBroker(cfg.paper), history=history, out=lines.append)
     return e, lines
+
+
+def restarted(e, records=RECORDS):
+    """The same database opened by a new run: history, then the stored fills."""
+    again, _ = engine(records, history=e.store.trades())
+    again.store = e.store
+    again.restore(e.store.fills())
+    return again
 
 
 async def test_engine_copies_a_conviction_buy_and_keeps_its_leader_after_a_restart():
@@ -149,10 +159,7 @@ async def test_engine_copies_a_conviction_buy_and_keeps_its_leader_after_a_resta
     assert h.leader == MITCH and h.entry_reason.startswith("conviction: mitch bought 19.60 SOL")
     assert any("PAPER BUY" in line for line in lines)
 
-    restarted, _ = engine()
-    restarted.store = e.store
-    restarted.restore(e.store.fills())
-    assert restarted.portfolio.holdings["Coin"].leader == MITCH
+    assert restarted(e).portfolio.holdings["Coin"].leader == MITCH
 
     same_price = 1e6 / 19.6
     await e.handle(trade(FROG, "buy", 1.0, 30, tokens=same_price))  # another wallet's trades don't move it
@@ -187,3 +194,76 @@ def test_run_lists_the_wallets_whose_big_buys_it_would_copy():
     assert _entry_rules(e.cfg, e).endswith("within 15 min, or when mrfrog buys 3x its usual entry or more")
     e.cfg.strategy.conviction_min_realized_sol = 1000
     assert "no followed wallet has the record for them" in _entry_rules(e.cfg, e)
+
+
+async def test_after_a_restart_it_follows_the_same_wallet_even_if_nicknames_changed():
+    e, _ = engine()
+    await e.handle(trade(MITCH, "buy", 19.6, 0))
+    # Profiling again (or in batches) can hand out the automatic nicknames differently.
+    shuffled = {MITCH: ("B", STRONG), FROG: ("mitch", RECORDS[FROG][1]), WEAK: ("mitch", RECORDS[WEAK][1])}
+    again = restarted(e, shuffled)
+    h = again.portfolio.holdings["Coin"]
+    assert h.leader == MITCH and h.leader_round == 1
+    await again.handle(trade(MITCH, "sell", 19.0, 60, tokens=1e6))
+    assert "Coin" not in again.portfolio.holdings
+    assert again.portfolio.closed[-1]["exit_reason"] == "B has sold 100% of its tokens"
+
+
+async def test_after_a_restart_a_leader_no_longer_followed_hands_over_to_the_other_buyers(caplog):
+    e, _ = engine()
+    await e.handle(trade(FROG, "buy", 1.0, -30, tokens=1e6 / 19.6))
+    await e.handle(trade(MITCH, "buy", 19.6, 0))
+    assert e.portfolio.holdings["Coin"].leader == MITCH
+    again = restarted(e, {FROG: RECORDS[FROG], WEAK: RECORDS[WEAK]})
+    assert "no longer followed" in caplog.text
+    await again.handle(trade(FROG, "sell", 1.0, 60, tokens=1e6 / 19.6))
+    assert again.portfolio.closed[-1]["exit_reason"] == "tracked cohort has sold 100% of its tokens"
+
+
+async def test_after_a_restart_it_notices_the_leader_left_while_the_bot_was_off():
+    e, _ = engine()
+    await e.handle(trade(MITCH, "buy", 19.6, 0))
+    e.store.add_trades([trade(MITCH, "sell", 19.0, 600, tokens=1e6), trade(MITCH, "buy", 5.0, 900, tokens=2e5)])
+    again = restarted(e)
+    await again.tick(T0 + 1000)
+    assert again.portfolio.closed[-1]["exit_reason"] == ("mitch has left the position the bot followed "
+                                                         "(and bought again since)")
+
+
+@pytest.mark.parametrize("sold", [0.5, 0.6])
+async def test_never_buys_into_the_leaders_exit(sold):
+    e, lines = engine(max_open_positions=0)
+    await e.handle(trade(MITCH, "buy", 19.6, 0))  # not copied: no room
+    e.cfg.strategy.max_open_positions = 5
+    await e.handle(trade(MITCH, "sell", 19.6 * sold, 30, tokens=1e6 * sold))
+    assert e.portfolio.fills == [] and lines[-1].endswith("not followed: it has sold since")
+
+
+async def test_follows_the_leader_out_once_even_when_reentry_is_allowed():
+    e, _ = engine(reenter_same_mint=True)
+    await e.handle(trade(MITCH, "buy", 19.6, 0))
+    await e.handle(trade(MITCH, "sell", 9.8, 30, tokens=5e5))
+    for k in range(4):  # more trades in the token within the 5 minutes
+        await e.handle(trade(FROG, "buy", 1.0, 40 + k * 10, tokens=1e6 / 19.6))
+    assert [f.side for f in e.portfolio.fills] == ["buy", "sell"]
+
+
+async def test_a_big_buy_from_a_position_since_closed_is_not_followed():
+    e, _ = engine(max_open_positions=0)
+    await e.handle(trade(MITCH, "buy", 19.6, 0))
+    await e.handle(trade(MITCH, "sell", 19.6, 60, tokens=1e6))
+    e.cfg.strategy.max_open_positions = 5
+    await e.handle(trade(MITCH, "buy", 0.5, 120, tokens=1e6 / 39.2))  # a small new position
+    assert e.portfolio.fills == []
+
+
+async def test_an_exit_missed_once_is_not_lost_when_the_leader_starts_a_new_position():
+    e, _ = engine()
+    await e.handle(trade(MITCH, "buy", 19.6, 0))
+    lock = e._lock("Coin")
+    async with lock:  # an order in flight: the dump's exit check is skipped
+        await e.handle(trade(MITCH, "sell", 19.6, 60, tokens=1e6))
+    assert "Coin" in e.portfolio.holdings
+    await e.handle(trade(MITCH, "buy", 0.001, 70, tokens=50))  # spam, recorded as tokens received
+    assert e.portfolio.closed[-1]["exit_reason"] == ("mitch has left the position the bot followed "
+                                                     "(and bought again since)")

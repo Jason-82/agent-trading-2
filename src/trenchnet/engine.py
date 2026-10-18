@@ -34,7 +34,8 @@ from .strategy import Order, Strategy
 log = logging.getLogger(__name__)
 
 _TP_REASON = re.compile(r"^take-profit (\d+):")
-_CONVICTION_REASON = re.compile(r"^conviction: (.+?) bought ")
+_CONVICTION_REASON = re.compile(r"^conviction: .*; following (\S+)$")
+RESTORE_CLOCK_SLACK_S = 60.0  # stored trade times and fill times can come from different clocks
 
 
 def tracked_from_roster(roster: list[dict]) -> dict[str, TrackedWallet]:
@@ -91,22 +92,28 @@ class Engine:
         """Rebuild the bot's holdings from stored fills after a restart, and
         reopen a case for each token still held so exits keep running."""
         names = {f.name for f in fields(Fill)}
-        by_alias = {tw.alias: w for w, tw in self.tracked.items()}
         for row in fills:
             fill = Fill(**{k: row[k] for k in names})
             m = _TP_REASON.match(fill.reason) if fill.side == "sell" else None
             c = _CONVICTION_REASON.match(fill.reason) if fill.side == "buy" else None
-            leader = by_alias.get(c.group(1)) if c else None
-            if c and leader is None:
-                log.warning("%s was bought following %s, who is no longer followed; it now follows "
-                            "the token's followed buyers out", short(fill.mint), c.group(1))
-            self.portfolio.apply(fill, tp_index=int(m.group(1)) - 1 if m else None, leader=leader)
+            self.portfolio.apply(fill, tp_index=int(m.group(1)) - 1 if m else None, leader=c.group(1) if c else None)
         for mint, h in self.portfolio.holdings.items():
             case = self.cases[mint] = Case(mint=mint, opened_ts=h.entry_ts)
             for t in self.store.trades(wallets=list(self.tracked_set), mint=mint):
                 case.add_event(t)
             if mint not in self.prices and case.last_price is not None:
                 self.prices[mint] = case.last_price
+            if h.leader is None:
+                continue
+            lead = self.ledger.get(h.leader, mint)
+            if h.leader not in self.tracked_set or lead is None:
+                log.warning("%s was bought following %s, which is no longer followed: it is now sold on the "
+                            "price and time exits, or when the token's followed buyers sell", short(mint),
+                            short(h.leader))
+            elif lead.first_buy_ts is not None and lead.first_buy_ts <= h.entry_ts + RESTORE_CLOCK_SLACK_S:
+                h.leader_round = lead.rounds  # still the position the bot followed
+            else:
+                h.leader_round = lead.rounds - 1  # it left that position (and came back) while the bot was off
 
     # -- events -----------------------------------------------------------
 
@@ -147,6 +154,8 @@ class Engine:
             # keep the wallet's position right, but there's nothing to judge or report.
             self.ledger.apply(t)
             self.graph.add_trade(t)
+            if case is not None:
+                await self._exits(case)  # e.g. the wallet a position follows moved its tokens away
             return
 
         self.ledger.apply(t)
@@ -287,7 +296,7 @@ class Engine:
         if fill is None:
             self.out(f"    ✗ {order.side} {short(order.mint)} not filled ({order.reason})")
             return
-        pnl = self.portfolio.apply(fill, tp_index=order.tp_index, leader=order.leader)
+        pnl = self.portfolio.apply(fill, tp_index=order.tp_index, leader=order.leader, leader_round=order.leader_round)
         self.store.add_fill(mint=fill.mint, side=fill.side, sol_amount=fill.sol_amount,
                             token_amount=fill.token_amount, price_sol=fill.price_sol, fee_sol=fill.fee_sol,
                             ts=fill.ts, mode=fill.mode, reason=fill.reason, tx_signature=fill.tx_signature)

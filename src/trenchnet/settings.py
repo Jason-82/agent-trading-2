@@ -23,6 +23,7 @@ from .textfile import read_text_any
 RESET_WORDS = ("default", "reset")
 _HEADER = re.compile(r"^\s*\[\s*([A-Za-z0-9_.-]+)\s*\]\s*(#.*)?$")
 _KEY_LINE = re.compile(r"^\s*[A-Za-z0-9_-]+\s*=")
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*=")  # a word that is itself section.key=value
 
 
 class SettingError(ValueError):
@@ -84,6 +85,8 @@ def resolve(name: str) -> Setting:
 def parse_value(setting: Setting, raw: str) -> Any:
     """The value typed after '=', checked against the setting's type. None means back to the default."""
     raw = raw.strip()
+    if not raw:
+        raise SettingError(f"give {setting.name} a value after '=' (or =default to go back to the default)")
     if raw.lower() in RESET_WORDS:
         return None
     try:
@@ -138,10 +141,12 @@ def split_assignments(words: list[str]) -> list[tuple[str, str | None]]:
     Spaces around '=' arrive as separate words."""
     joined: list[str] = []
     for w in words:
-        if joined and (joined[-1].endswith("=") or w.startswith("=")):
-            joined[-1] += w
-        else:
-            joined.append(w)
+        if joined:
+            _, eq, value = joined[-1].partition("=")
+            if (not eq and w.startswith("=")) or (eq and not value and not _ASSIGNMENT.match(w)):
+                joined[-1] += w
+                continue
+        joined.append(w)
     out: list[tuple[str, str | None]] = []
     for w in joined:
         name, eq, value = w.partition("=")

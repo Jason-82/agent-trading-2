@@ -25,6 +25,7 @@ class Holding:
     tp_hit: set[int] = field(default_factory=set)
     realized_sol: float = 0.0
     leader: str | None = None  # conviction entries: the wallet whose exit the position follows
+    leader_round: int | None = None  # ... and which of that wallet's positions in the token (Position.rounds)
 
 
 class Portfolio:
@@ -39,7 +40,8 @@ class Portfolio:
         self.fills: list[Fill] = []
         self.reconciled: list[dict] = []
 
-    def apply(self, f: Fill, tp_index: int | None = None, leader: str | None = None) -> float:
+    def apply(self, f: Fill, tp_index: int | None = None, leader: str | None = None,
+              leader_round: int | None = None) -> float:
         """Apply a fill; returns realized PnL of this fill (0 for buys and reconciliations).
         `leader` marks a new holding as a conviction entry following that wallet."""
         self.fills.append(f)
@@ -52,7 +54,8 @@ class Portfolio:
             h = self.holdings.get(f.mint)
             if h is None:
                 h = Holding(mint=f.mint, tokens=0.0, original_tokens=0.0, cost_sol=0.0, entry_price=f.price_sol,
-                            entry_ts=f.ts, peak_price=f.price_sol, entry_reason=f.reason, leader=leader)
+                            entry_ts=f.ts, peak_price=f.price_sol, entry_reason=f.reason, leader=leader,
+                            leader_round=leader_round)
                 self.holdings[f.mint] = h
             h.tokens += f.token_amount
             h.original_tokens += f.token_amount
